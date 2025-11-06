@@ -1,0 +1,138 @@
+from typing import List, Dict, Any, Tuple
+import time
+from datetime import datetime
+
+from services.database import DatabaseService
+from services.llm import LLMService
+from utils.parsing import extract_sql_queries
+
+class QueryService:
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService):
+        self.db_service = db_service
+        self.llm_service = llm_service
+        self.query_history = []
+        
+    def validate_prerequisites(self):
+        """Validate that all prerequisites are met"""
+        if not self.db_service.is_connected():
+            raise ValueError("Database is not connected. Please connect to a database first.")
+        
+        if not self.llm_service.is_configured():
+            config_details = self.llm_service.get_config_details()
+            error_msg = "LLM is not configured. Please configure the LLM service first."
+            if config_details:
+                error_msg += f" Current config state: {config_details}"
+            raise ValueError(error_msg)
+        
+    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0) -> Dict[str, Any]:
+        """Process natural language query and return results"""
+        start_time = time.time()
+        
+        try:
+            # Validate prerequisites first
+            self.validate_prerequisites()
+            
+            print(f"Processing query: {user_query[:100]}...")
+            
+            # Get database and LLM instances
+            db = self.db_service.get_langchain_db()
+            llm = self.llm_service.get_llm()
+            
+            print("✓ Got database and LLM instances")
+            
+            # Get simplified schema info (avoids SQL DDL to reduce WAF triggers)
+            table_info = self.db_service.get_simplified_schema()
+            print(f"✓ Got simplified schema: {len(table_info)} characters")
+            
+            # Generate SQL query
+            sql_chain = self.llm_service.create_sql_chain(db)
+            print("✓ Created SQL chain")
+            
+            generated_text = sql_chain.invoke({
+                "Question": user_query,
+                "schema_info": table_info,
+                "table_info": table_info
+            })
+            print(f"✓ Generated text: {generated_text[:200]}...")
+            
+            # Extract SQL queries
+            sql_queries = extract_sql_queries(str(generated_text))
+            
+            if not sql_queries:
+                raise ValueError(f"No SQL queries generated from the LLM response: {generated_text}")
+            
+            print(f"✓ Extracted {len(sql_queries)} SQL queries")
+            
+            # Execute queries and collect results
+            results = []
+            for i, query in enumerate(sql_queries):
+                print(f"Executing query {i+1}: {query[:100]}...")
+                query_result = self.db_service.execute_query(query)
+                
+                # Ensure the result is properly formatted
+                if isinstance(query_result, list):
+                    # Already converted to list of dicts in database service
+                    formatted_result = query_result
+                elif isinstance(query_result, dict):
+                    # Command result (INSERT, UPDATE, DELETE, etc.)
+                    formatted_result = query_result
+                else:
+                    # Fallback for unexpected types
+                    formatted_result = {"raw_result": str(query_result)}
+                
+                results.append(formatted_result)
+            
+            print("✓ Executed all queries")
+            
+            # Generate natural language explanation
+            explanation_chain = self.llm_service.create_explanation_chain()
+            result_text = "\n".join([str(r) for r in results])
+            explanation = explanation_chain.invoke({
+                "Question": user_query,
+                "schema_info": table_info,
+            })
+            
+            print("✓ Generated explanation")
+            
+            # Calculate execution time
+            execution_time = time.time() - start_time
+            
+            # Prepare response
+            response = {
+                "query": user_query,
+                "sql_queries": [{"sql": sql_queries[i], "order": i} for i in range(len(sql_queries))],
+                "results": results,  # Now properly formatted as list of dicts or dict objects
+                "explanation": explanation,
+                "timestamp": datetime.now(),
+                "execution_time": execution_time
+            }
+            
+            # Store in history
+            self.query_history.append(response)
+            
+            print(f"✓ Query processed successfully in {execution_time:.2f}s")
+            return response
+            
+        except Exception as e:
+            print(f"✗ Query processing failed: {str(e)}")
+            raise RuntimeError(f"Query processing failed: {str(e)}")
+    
+    def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get query history"""
+        return self.query_history[-limit:] if self.query_history else []
+    
+    def clear_history(self):
+        """Clear query history"""
+        self.query_history = []
+    
+    def get_result_by_index(self, index: int) -> Dict[str, Any]:
+        """Get query result by index from history"""
+        if index < 0 or index >= len(self.query_history):
+            raise ValueError(f"Invalid index {index}. History has {len(self.query_history)} items.")
+        return self.query_history[index]
+    
+    def get_latest_result(self) -> Dict[str, Any]:
+        """Get the latest query result"""
+        if not self.query_history:
+            raise ValueError("No query results in history")
+        return self.query_history[-1]
