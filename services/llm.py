@@ -13,7 +13,7 @@ class LLMService:
         self.config_details: Optional[Dict[str, Any]] = None
         self.last_error: Optional[str] = None
         
-    def test_api_key(self, api_key: str, base_url: str, headers: Optional[Dict[str, str]] = None) -> bool:
+    def test_api_key(self, api_key: str, base_url: str, model: str = "gpt-3.5-turbo", headers: Optional[Dict[str, str]] = None) -> bool:
         """Test if the API key is valid by making a simple request"""
         try:
             self.last_error = None
@@ -27,7 +27,7 @@ class LLMService:
             
             # Simple test payload
             test_payload = {
-                "model": "Llama-3.3-70B-Instruct",
+                "model": model,
                 "messages": [{"role": "user", "content": "Hello"}],
                 "max_tokens": 10
             }
@@ -40,22 +40,22 @@ class LLMService:
             )
             
             if response.status_code == 200:
-                print("✅ API Key validation successful")
+                print("API Key validation successful")
                 return True
             elif response.status_code == 401:
                 self.last_error = "Unauthorized (401): Invalid API key"
-                print(f"❌ API Key validation failed: {self.last_error}")
+                print(f"API Key validation failed: {self.last_error}")
                 return False
             else:
                 # Capture a short preview of the body to avoid huge logs
                 body_preview = response.text[:300].replace("\n", " ")
                 self.last_error = f"HTTP {response.status_code}: {body_preview}"
-                print(f"❌ API Key validation failed: {self.last_error}")
+                print(f"API Key validation failed: {self.last_error}")
                 return False
                 
         except Exception as e:
             self.last_error = f"Exception during API key test: {e}"
-            print(f"⚠️ API Key test failed with exception: {e}")
+            print(f"API Key test failed with exception: {e}")
             return False  # Conservative approach
         
     def configure(self, api_key: str, base_url: str = None, model: str = None, headers: Optional[Dict[str, str]] = None) -> bool:
@@ -67,9 +67,14 @@ class LLMService:
             # Clean up the inputs
             api_key = api_key.strip()
             base_url = (base_url or settings.openai_api_base).strip()
+            
+            # Default to OpenAI official API if base_url is empty
+            if not base_url:
+                base_url = "https://api.openai.com/v1"
+                
             model = (model or settings.llm_model_name).strip()
             
-            print(f"🔧 Configuring LLM with:")
+            print(f"Configuring LLM with:")
             print(f"   API Base: {base_url}")
             print(f"   Model: {model}")
             print(f"   API Key: {api_key[:10]}...")
@@ -77,8 +82,8 @@ class LLMService:
                 print(f"   Custom headers: {list(headers.keys())}")
             
             # Test the API key first
-            if not self.test_api_key(api_key, base_url, headers):
-                raise ValueError(self.last_error or "Invalid API key or connection failed. Please check your Krutrim Cloud credentials and network access.")
+            if not self.test_api_key(api_key, base_url, model, headers):
+                raise ValueError(self.last_error or "Invalid API key or connection failed. Please check your credentials and network access.")
             
             # Store configuration details
             self.config_details = {
@@ -99,14 +104,14 @@ class LLMService:
             )
             
             self.configured = True
-            print(f"✅ LLM configured successfully with model: {model}")
+            print(f"LLM configured successfully with model: {model}")
             return True
             
         except Exception as e:
             self.configured = False
             self.llm = None
             self.config_details = None
-            print(f"❌ LLM configuration failed: {str(e)}")
+            print(f"LLM configuration failed: {str(e)}")
             raise RuntimeError(f"LLM configuration failed: {str(e)}")
     
     def is_configured(self) -> bool:
@@ -128,7 +133,7 @@ class LLMService:
         self.llm = None
         self.configured = False
         self.config_details = None
-        print("🔄 LLM configuration reset")
+        print("LLM configuration reset")
     
     def create_sql_chain(self, db):
         """Create SQL query chain"""
@@ -177,5 +182,3 @@ class LLMService:
     - If schema has "created_at" instead of "date", use "created_at"
     """
 ) | self.llm | StrOutputParser()
-
-        

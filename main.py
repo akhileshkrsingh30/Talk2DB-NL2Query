@@ -14,7 +14,7 @@ from schemas import HealthCheck
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Initialize services
-    print("🚀 Initializing services...")
+    print("Initializing services...")
     
     db_service = DatabaseService()
     llm_service = LLMService()
@@ -28,26 +28,38 @@ async def lifespan(app: FastAPI):
     # Try to configure LLM from environment variables
     if settings.krutim_cloud_api_key and settings.krutim_cloud_api_key.strip():
         try:
-            print("🔧 Configuring LLM from environment variables...")
+            print("Configuring LLM from environment variables (Krutim)...")
             llm_service.configure(
                 api_key=settings.krutim_cloud_api_key,
                 base_url=settings.openai_api_base,
                 model=settings.llm_model_name
             )
-            print("✅ LLM configured successfully from environment variables")
+            print("LLM configured successfully from environment variables")
         except Exception as e:
-            print(f"❌ LLM configuration failed: {e}")
-            print("💡 LLM can be configured later using the /database/configure-llm endpoint")
+            print(f"LLM configuration failed: {e}")
+            print("LLM can be configured later using the /database/configure-llm endpoint")
+    elif settings.openai_api_key and settings.openai_api_key.strip():
+        try:
+            print("Configuring LLM from environment variables (OpenAI)...")
+            llm_service.configure(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_api_base,
+                model=settings.llm_model_name
+            )
+            print("LLM configured successfully from environment variables")
+        except Exception as e:
+            print(f"LLM configuration failed: {e}")
+            print("LLM can be configured later using the /database/configure-llm endpoint")
     else:
-        print("⚠️ No API key found in environment. LLM can be configured using the /database/configure-llm endpoint")
+        print("No API key found in environment. LLM can be configured using the /database/configure-llm endpoint")
     
-    print("✅ Services initialized successfully")
+    print("Services initialized successfully")
     yield
     
     # Shutdown: Clean up resources
-    print("🛑 Shutting down services...")
+    print("Shutting down services...")
     service_registry.cleanup()
-    print("✅ Services shut down successfully")
+    print("Services shut down successfully")
 
 app = FastAPI(
     title=settings.app_title,

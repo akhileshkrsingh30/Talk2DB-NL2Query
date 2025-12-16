@@ -21,8 +21,9 @@ class Settings(BaseSettings):
     
     # LLM configuration
     krutim_cloud_api_key: str = Field("", env="KRUTIM_CLOUD_API_KEY")
+    openai_api_key: str = Field("", env="OPENAI_API_KEY")
     openai_api_base: str = Field("https://cloud.olakrutrim.com/v1", env="OPENAI_API_BASE")
-    llm_model_name: str = Field("Llama-3.3-70B-Instruct", env="MODEL_NAME")
+    llm_model_name: str = "gpt-4-turbo"
     
     # Application settings
     app_title: str = "Database Query API"
@@ -33,7 +34,7 @@ class Settings(BaseSettings):
         super().__init__(**kwargs)
         
         # Debug: Print loaded environment variables
-        print("🔧 Environment variables loaded:")
+        print("Environment variables loaded:")
         print(f"   DB_HOST: {self.db_host}")
         print(f"   DB_NAME: {self.db_name}")
         print(f"   DB_USER: {self.db_user}")
