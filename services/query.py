@@ -4,13 +4,15 @@ from datetime import datetime
 
 from services.database import DatabaseService
 from services.llm import LLMService
+from services.billing.billing_service import BillingService
 from utils.parsing import extract_sql_queries
 import tiktoken
 
 class QueryService:
-    def __init__(self, db_service: DatabaseService, llm_service: LLMService):
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None):
         self.db_service = db_service
         self.llm_service = llm_service
+        self.billing_service = billing_service
         self.query_history = []
         try:
             self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -127,6 +129,11 @@ class QueryService:
             # Calculate execution time
             execution_time = time.time() - start_time
             
+            # Calculate billing if service is available
+            billing_info = None
+            if self.billing_service:
+                billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens)
+            
             # Prepare response
             response = {
                 "query": user_query,
@@ -137,7 +144,8 @@ class QueryService:
                 "execution_time": execution_time,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
+                "total_tokens": input_tokens + output_tokens,
+                "billing": billing_info
             }
             
             # Store in history

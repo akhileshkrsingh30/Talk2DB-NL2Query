@@ -34,6 +34,7 @@ class QueryResult(BaseModel):
     input_tokens: Optional[int] = Field(None, description="Number of input tokens")
     output_tokens: Optional[int] = Field(None, description="Number of output tokens")
     total_tokens: Optional[int] = Field(None, description="Total number of tokens used")
+    billing: Optional[Dict[str, Any]] = Field(None, description="Billing and cost information")
     
     class Config:
         # Allow any additional fields that might come from the database

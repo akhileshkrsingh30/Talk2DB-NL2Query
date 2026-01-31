@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     openai_api_base: str = Field("", env="OPENAI_API_BASE")
     llm_model_name: str = Field("gpt-5.2", env="LLM_MODEL_NAME")
     
+    # Billing configuration (Price per 1M tokens in USD)
+    price_input_1m: float = Field(0.15, env="BILLING_PRICE_INPUT_1M")
+    price_output_1m: float = Field(0.60, env="BILLING_PRICE_OUTPUT_1M")
+    
     # Application settings
     app_title: str = "Database Query API"
     app_version: str = "1.0.0"
