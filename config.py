@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     # LLM configuration
     krutim_cloud_api_key: str = Field("", env="KRUTIM_CLOUD_API_KEY")
     openai_api_key: str = Field("", env="OPENAI_API_KEY")
-    openai_api_base: str = Field("https://cloud.olakrutrim.com/v1", env="OPENAI_API_BASE")
-    llm_model_name: str = "gpt-4-turbo"
+    openai_api_base: str = Field("", env="OPENAI_API_BASE")
+    llm_model_name: str = Field("gpt-5.2", env="LLM_MODEL_NAME")
     
     # Application settings
     app_title: str = "Database Query API"

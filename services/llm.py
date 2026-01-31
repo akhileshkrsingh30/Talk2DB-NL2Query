@@ -29,7 +29,7 @@ class LLMService:
             test_payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 10
+                "max_completion_tokens": 10
             }
             
             response = requests.post(
@@ -99,7 +99,7 @@ class LLMService:
                 openai_api_key=api_key,
                 model=model,
                 temperature=0.0,
-                max_tokens=1024,
+                model_kwargs={"max_completion_tokens": 1024},
                 default_headers=headers,
             )
             

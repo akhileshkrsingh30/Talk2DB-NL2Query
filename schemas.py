@@ -31,6 +31,9 @@ class QueryResult(BaseModel):
     explanation: str = Field(..., description="Natural language explanation of results")
     timestamp: datetime = Field(..., description="When the query was executed")
     execution_time: Optional[float] = Field(None, description="Execution time in seconds")
+    input_tokens: Optional[int] = Field(None, description="Number of input tokens")
+    output_tokens: Optional[int] = Field(None, description="Number of output tokens")
+    total_tokens: Optional[int] = Field(None, description="Total number of tokens used")
     
     class Config:
         # Allow any additional fields that might come from the database
