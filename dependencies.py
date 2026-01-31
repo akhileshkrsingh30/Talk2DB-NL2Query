@@ -7,6 +7,7 @@ from services.registry import service_registry
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
+from services.billing.billing_service import BillingService
 
 def get_db_service() -> DatabaseService:
     """Dependency to get database service instance"""
@@ -32,6 +33,16 @@ def get_sharing_service() -> SharingService:
     """Dependency to get sharing service instance"""
     try:
         return service_registry.get_sharing_service()
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+def get_billing_service() -> BillingService:
+    """Dependency to get billing service instance"""
+    try:
+        return service_registry.get_billing_service()
     except RuntimeError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -9,23 +9,26 @@ from services.database import DatabaseService
 from services.llm import LLMService
 from services.query import QueryService
 from services.sharing import SharingService
-from dependencies import get_db_service, get_llm_service, get_sharing_service
+from services.billing.billing_service import BillingService
+from dependencies import get_db_service, get_llm_service, get_sharing_service, get_billing_service
 
 router = APIRouter(prefix="/queries", tags=["queries"])
 
 def get_query_service(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    billing_service: Annotated[BillingService, Depends(get_billing_service)]
 ) -> QueryService:
     """Get a fresh query service instance with current service states"""
     # Always create a fresh instance to ensure we have the latest service states
-    return QueryService(db_service, llm_service)
+    return QueryService(db_service, llm_service, billing_service)
 
 @router.post("/process", response_model=QueryResult, responses={400: {"model": ErrorResponse}})
 async def process_natural_language_query(
     query_request: QueryRequest,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    billing_service: Annotated[BillingService, Depends(get_billing_service)]
 ):
     """Process a natural language query and return SQL results"""
     try:
@@ -47,7 +50,7 @@ async def process_natural_language_query(
             )
         
         # Create query service with fresh references
-        query_service = QueryService(db_service, llm_service)
+        query_service = QueryService(db_service, llm_service, billing_service)
         
         result = query_service.process_query(
             query_request.query,
@@ -86,7 +89,8 @@ async def process_natural_language_query(
 async def process_natural_language_query_batch(
     batch_request: BatchQueryRequest,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    billing_service: Annotated[BillingService, Depends(get_billing_service)]
 ):
     try:
         if not db_service.is_connected():
@@ -112,7 +116,7 @@ async def process_natural_language_query_batch(
             results: List[QueryResult] = [None] * len(batch_request.queries)
 
             def run_item(index: int, q):
-                service = QueryService(db_service, llm_service)
+                service = QueryService(db_service, llm_service, billing_service)
                 return service.process_query(q.query, q.max_tokens, q.temperature)
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -124,7 +128,7 @@ async def process_natural_language_query_batch(
                     idx = future_map[future]
                     results[idx] = future.result()
         else:
-            query_service = QueryService(db_service, llm_service)
+            query_service = QueryService(db_service, llm_service, billing_service)
             results: List[QueryResult] = []
             for item in batch_request.queries:
                 res = query_service.process_query(

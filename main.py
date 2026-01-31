@@ -8,6 +8,7 @@ from routers import database, queries, sharing
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
+from services.billing.billing_service import BillingService
 from services.registry import service_registry
 from schemas import HealthCheck
 
@@ -19,11 +20,13 @@ async def lifespan(app: FastAPI):
     db_service = DatabaseService()
     llm_service = LLMService()
     sharing_service = SharingService()
+    billing_service = BillingService()
     
     # Register services in the registry
     service_registry.set_db_service(db_service)
     service_registry.set_llm_service(llm_service)
     service_registry.set_sharing_service(sharing_service)
+    service_registry.set_billing_service(billing_service)
     
     # Try to configure LLM from environment variables
     if settings.krutim_cloud_api_key and settings.krutim_cloud_api_key.strip():

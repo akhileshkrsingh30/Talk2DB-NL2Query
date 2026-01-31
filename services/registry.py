@@ -2,6 +2,7 @@ from typing import Optional
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
+from services.billing.billing_service import BillingService
 
 class ServiceRegistry:
     """Global service registry for dependency injection"""
@@ -10,6 +11,7 @@ class ServiceRegistry:
         self._db_service: Optional[DatabaseService] = None
         self._llm_service: Optional[LLMService] = None
         self._sharing_service: Optional[SharingService] = None
+        self._billing_service: Optional[BillingService] = None
     
     def set_db_service(self, service: DatabaseService):
         self._db_service = service
@@ -35,6 +37,14 @@ class ServiceRegistry:
             raise RuntimeError("Sharing service not initialized")
         return self._sharing_service
     
+    def set_billing_service(self, service: BillingService):
+        self._billing_service = service
+    
+    def get_billing_service(self) -> BillingService:
+        if self._billing_service is None:
+            raise RuntimeError("Billing service not initialized")
+        return self._billing_service
+    
     def cleanup(self):
         """Cleanup all services"""
         if self._db_service:
@@ -42,6 +52,7 @@ class ServiceRegistry:
         self._db_service = None
         self._llm_service = None
         self._sharing_service = None
+        self._billing_service = None
 
 # Global service registry instance
 service_registry = ServiceRegistry()
