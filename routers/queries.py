@@ -55,7 +55,9 @@ async def process_natural_language_query(
         result = query_service.process_query(
             query_request.query,
             query_request.max_tokens,
-            query_request.temperature
+            query_request.temperature,
+            user_id=query_request.user_id,
+            session_id=query_request.session_id
         )
         return result
         
@@ -117,7 +119,13 @@ async def process_natural_language_query_batch(
 
             def run_item(index: int, q):
                 service = QueryService(db_service, llm_service, billing_service)
-                return service.process_query(q.query, q.max_tokens, q.temperature)
+                return service.process_query(
+                    q.query, 
+                    q.max_tokens, 
+                    q.temperature,
+                    user_id=q.user_id,
+                    session_id=q.session_id
+                )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
@@ -134,7 +142,9 @@ async def process_natural_language_query_batch(
                 res = query_service.process_query(
                     item.query,
                     item.max_tokens,
-                    item.temperature
+                    item.temperature,
+                    user_id=item.user_id,
+                    session_id=item.session_id
                 )
                 results.append(res)
 
@@ -192,7 +202,9 @@ async def process_and_share_query(
         result = query_service.process_query(
             query_request.query,
             query_request.max_tokens,
-            query_request.temperature
+            query_request.temperature,
+            user_id=query_request.user_id,
+            session_id=query_request.session_id
         )
         
         # Share the result

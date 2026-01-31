@@ -19,6 +19,8 @@ class QueryRequest(BaseModel):
     query: str = Field(..., description="Natural language query")
     max_tokens: Optional[int] = Field(1024, description="Maximum tokens for LLM response")
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
+    user_id: Optional[str] = Field(None, description="Optional user identifier")
+    session_id: Optional[str] = Field(None, description="Optional session identifier")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")
@@ -35,6 +37,8 @@ class QueryResult(BaseModel):
     output_tokens: Optional[int] = Field(None, description="Number of output tokens")
     total_tokens: Optional[int] = Field(None, description="Total number of tokens used")
     billing: Optional[Dict[str, Any]] = Field(None, description="Billing and cost information")
+    user_id: Optional[str] = Field(None, description="User identifier from request")
+    session_id: Optional[str] = Field(None, description="Session identifier from request")
     
     class Config:
         # Allow any additional fields that might come from the database

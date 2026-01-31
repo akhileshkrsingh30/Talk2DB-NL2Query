@@ -7,7 +7,7 @@ class BillingService:
         self.input_rate = settings.price_input_1m / 1_000_000
         self.output_rate = settings.price_output_1m / 1_000_000
 
-    def calculate_cost(self, input_tokens: int, output_tokens: int) -> Dict[str, Any]:
+    def calculate_cost(self, input_tokens: int, output_tokens: int, user_id: str = None, session_id: str = None) -> Dict[str, Any]:
         """
         Calculate the cost of a request based on token usage.
         Returns a dictionary with cost details.
@@ -17,6 +17,8 @@ class BillingService:
         total_cost = input_cost + output_cost
 
         return {
+            "user_id": user_id,
+            "session_id": session_id,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,

@@ -37,7 +37,7 @@ class QueryService:
                 error_msg += f" Current config state: {config_details}"
             raise ValueError(error_msg)
         
-    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0) -> Dict[str, Any]:
+    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0, user_id: str = None, session_id: str = None) -> Dict[str, Any]:
         """Process natural language query and return results"""
         start_time = time.time()
         
@@ -132,7 +132,7 @@ class QueryService:
             # Calculate billing if service is available
             billing_info = None
             if self.billing_service:
-                billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens)
+                billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens, user_id, session_id)
             
             # Prepare response
             response = {
@@ -145,7 +145,9 @@ class QueryService:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
-                "billing": billing_info
+                "billing": billing_info,
+                "user_id": user_id,
+                "session_id": session_id
             }
             
             # Store in history
