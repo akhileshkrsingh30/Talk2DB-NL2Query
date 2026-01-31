@@ -5,12 +5,23 @@ from datetime import datetime
 from services.database import DatabaseService
 from services.llm import LLMService
 from utils.parsing import extract_sql_queries
+import tiktoken
 
 class QueryService:
     def __init__(self, db_service: DatabaseService, llm_service: LLMService):
         self.db_service = db_service
         self.llm_service = llm_service
         self.query_history = []
+        try:
+            self.encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self.encoding = None
+            
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text using tiktoken"""
+        if not text or not self.encoding:
+            return 0
+        return len(self.encoding.encode(text))
         
     def validate_prerequisites(self):
         """Validate that all prerequisites are met"""
@@ -48,12 +59,22 @@ class QueryService:
             sql_chain = self.llm_service.create_sql_chain(db)
             print("✓ Created SQL chain")
             
-            generated_text = sql_chain.invoke({
+            # Prepare input data for SQL generation
+            sql_input = {
                 "Question": user_query,
                 "schema_info": table_info,
                 "table_info": table_info
-            })
+            }
+            
+            # Count input tokens for SQL generation (approximate by counting variables)
+            # For more accuracy, we would count the full formatted prompt
+            input_tokens = self.count_tokens(user_query) + self.count_tokens(table_info) * 2
+            
+            generated_text = sql_chain.invoke(sql_input)
             print(f"✓ Generated text: {generated_text[:200]}...")
+            
+            # Count output tokens for SQL generation
+            output_tokens = self.count_tokens(str(generated_text))
             
             # Extract SQL queries
             sql_queries = extract_sql_queries(str(generated_text))
@@ -86,11 +107,20 @@ class QueryService:
             
             # Generate natural language explanation
             explanation_chain = self.llm_service.create_explanation_chain()
-            result_text = "\n".join([str(r) for r in results])
-            explanation = explanation_chain.invoke({
+            
+            # Prepare input data for explanation
+            explanation_input = {
                 "Question": user_query,
                 "schema_info": table_info,
-            })
+            }
+            
+            # Add to input tokens for explanation
+            input_tokens += self.count_tokens(user_query) + self.count_tokens(table_info)
+            
+            explanation = explanation_chain.invoke(explanation_input)
+            
+            # Add to output tokens for explanation
+            output_tokens += self.count_tokens(str(explanation))
             
             print("✓ Generated explanation")
             
@@ -101,16 +131,19 @@ class QueryService:
             response = {
                 "query": user_query,
                 "sql_queries": [{"sql": sql_queries[i], "order": i} for i in range(len(sql_queries))],
-                "results": results,  # Now properly formatted as list of dicts or dict objects
+                "results": results,
                 "explanation": explanation,
                 "timestamp": datetime.now(),
-                "execution_time": execution_time
+                "execution_time": execution_time,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens
             }
             
             # Store in history
             self.query_history.append(response)
             
-            print(f"✓ Query processed successfully in {execution_time:.2f}s")
+            print(f"✓ Query processed successfully in {execution_time:.2f}s | Tokens: In={input_tokens}, Out={output_tokens}")
             return response
             
         except Exception as e:
