@@ -9,10 +9,11 @@ from utils.parsing import extract_sql_queries
 import tiktoken
 
 class QueryService:
-    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None):
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None):
         self.db_service = db_service
         self.llm_service = llm_service
         self.billing_service = billing_service
+        self.mongodb_service = mongodb_service
         self.query_history = []
         try:
             self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -37,7 +38,7 @@ class QueryService:
                 error_msg += f" Current config state: {config_details}"
             raise ValueError(error_msg)
         
-    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0) -> Dict[str, Any]:
+    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0, user_id: str = None, session_id: str = None) -> Dict[str, Any]:
         """Process natural language query and return results"""
         start_time = time.time()
         
@@ -114,6 +115,7 @@ class QueryService:
             explanation_input = {
                 "Question": user_query,
                 "schema_info": table_info,
+                "results": str(results)
             }
             
             # Add to input tokens for explanation
@@ -132,7 +134,7 @@ class QueryService:
             # Calculate billing if service is available
             billing_info = None
             if self.billing_service:
-                billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens)
+                billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens, user_id, session_id)
             
             # Prepare response
             response = {
@@ -145,13 +147,24 @@ class QueryService:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
-                "billing": billing_info
+                "billing": billing_info,
+                "user_id": user_id,
+                "session_id": session_id
             }
             
             # Store in history
             self.query_history.append(response)
             
-            print(f"✓ Query processed successfully in {execution_time:.2f}s | Tokens: In={input_tokens}, Out={output_tokens}")
+            # Persist to MongoDB if available
+            if self.mongodb_service:
+                try:
+                    mongo_id = self.mongodb_service.save_result(response)
+                    response["mongodb_id"] = mongo_id
+                    print(f"[INFO] Result saved to MongoDB with ID: {mongo_id}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to save to MongoDB: {e}")
+            
+            print(f"[INFO] Query processed successfully in {execution_time:.2f}s | Tokens: In={input_tokens}, Out={output_tokens}")
             return response
             
         except Exception as e:
@@ -159,7 +172,17 @@ class QueryService:
             raise RuntimeError(f"Query processing failed: {str(e)}")
     
     def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get query history"""
+        """Get query history. Falls back to MongoDB if available for persistent history."""
+        # Try to get from MongoDB for persistent history
+        if self.mongodb_service:
+            try:
+                mongo_history = self.mongodb_service.get_history(limit)
+                if mongo_history:
+                    return mongo_history
+            except Exception as e:
+                print(f"[ERROR] Failed to fetch history from MongoDB: {e}")
+        
+        # Fallback to in-memory history
         return self.query_history[-limit:] if self.query_history else []
     
     def clear_history(self):

@@ -2,6 +2,12 @@ from pydantic_settings import BaseSettings
 from pydantic import Field, ConfigDict
 from typing import Optional
 import os
+from dotenv import load_dotenv
+
+# Explicitly load .env from the current directory
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(env_path)
+print(f"Loading .env from: {env_path} (exists: {os.path.exists(env_path)})")
 
 class Settings(BaseSettings):
     model_config = ConfigDict(
@@ -29,10 +35,17 @@ class Settings(BaseSettings):
     price_input_1m: float = Field(0.15, env="BILLING_PRICE_INPUT_1M")
     price_output_1m: float = Field(0.60, env="BILLING_PRICE_OUTPUT_1M")
     
+    # MongoDB configuration
+    mongo_uri: str = Field("mongodb://localhost:27017/", env="MONGO_URI")
+    mongo_db_name: str = Field("ValoDSS", env="MONGO_DB_NAME")
+    
     # Application settings
     app_title: str = "Database Query API"
     app_version: str = "1.0.0"
     app_description: str = "API for natural language to SQL conversion and execution"
+    
+    # Auth configuration
+    auth_api_url: str = Field("http://10.199.207.78:8080/jwt-0.0.1-SNAPSHOT/api/protected", env="AUTH_API_URL")
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -43,7 +56,14 @@ class Settings(BaseSettings):
         print(f"   DB_NAME: {self.db_name}")
         print(f"   DB_USER: {self.db_user}")
         print(f"   KRUTIM_CLOUD_API_KEY: {self.krutim_cloud_api_key[:10]}..." if self.krutim_cloud_api_key else "   KRUTIM_CLOUD_API_KEY: (not set)")
+        print(f"   OPENAI_API_KEY: {self.openai_api_key[:10]}..." if self.openai_api_key else "   OPENAI_API_KEY: (not set)")
         print(f"   OPENAI_API_BASE: {self.openai_api_base}")
         print(f"   MODEL_NAME: {self.llm_model_name}")
+        print(f"   MONGO_URI: {self.mongo_uri}")
+        print(f"   MONGO_DB_NAME: {self.mongo_db_name}")
+        
+        env_path = os.path.join(os.getcwd(), ".env")
+        print(f"   Current Working Directory: {os.getcwd()}")
+        print(f"   .env file exists: {os.path.exists(env_path)}")
 
 settings = Settings()

@@ -65,17 +65,21 @@ class DatabaseService:
         """Establish database connection"""
         try:
             # Validate required parameters
-            if not all(connection_params.values()):
-                raise ValueError("All connection fields are required")
+            required_fields = ["host", "port", "user", "password"]
+            if not all(connection_params.get(field) for field in required_fields):
+                raise ValueError(f"Required connection fields missing: {', '.join([f for f in required_fields if not connection_params.get(f)])}")
                 
             if not str(connection_params["port"]).isdigit():
                 raise ValueError("Port must be a number")
+                
+            # Default to 'postgres' if no database name provided
+            db_name = connection_params.get("database") or "postgres"
                 
             # Test connection
             with psycopg2.connect(
                 host=connection_params["host"],
                 port=int(connection_params["port"]),
-                database=connection_params["database"],
+                database=db_name,
                 user=connection_params["user"],
                 password=connection_params["password"],
                 connect_timeout=5,
@@ -85,7 +89,9 @@ class DatabaseService:
                     self.db_version = cur.fetchone()[0]
             
             # Store connection parameters if successful
-            self.connection_params = connection_params
+            final_params = connection_params.copy()
+            final_params["database"] = db_name
+            self.connection_params = final_params
             self.connected = True
             return True
             
@@ -113,6 +119,51 @@ class DatabaseService:
         """Get database version"""
         return self.db_version
     
+    def get_databases(self) -> List[str]:
+        """List all databases in the connected server"""
+        if not self.connected:
+            raise RuntimeError("Database not connected")
+            
+        try:
+            with self.create_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT datname FROM pg_database WHERE datistemplate = false;")
+                    rows = cursor.fetchall()
+                    return [row['datname'] if isinstance(row, dict) else row[0] for row in rows]
+        except Exception as e:
+            raise RuntimeError(f"Failed to list databases: {str(e)}")
+    
+    def select_database(self, db_name: str) -> bool:
+        """Switch to a specific database using current connection credentials"""
+        if not self.connection_params:
+            raise RuntimeError("Must connect to server first with /connect")
+            
+        # Create a copy of existing params with the new database name
+        new_params = self.connection_params.copy()
+        new_params["database"] = db_name
+        
+        # Attempt to connect to the new database
+        try:
+            with psycopg2.connect(
+                host=new_params["host"],
+                port=int(new_params["port"]),
+                database=new_params["database"],
+                user=new_params["user"],
+                password=new_params["password"],
+                connect_timeout=5,
+            ) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT version()")
+                    self.db_version = cur.fetchone()[0]
+            
+            # Update connection params and state
+            self.connection_params = new_params
+            self.connected = True
+            self._schema_cache = {} # Clear schema cache for the new database
+            return True
+        except Exception as e:
+            raise RuntimeError(f"Failed to switch to database '{db_name}': {str(e)}")
+
     def create_connection(self) -> psycopg2.extensions.connection:
         """Create a new database connection"""
         if not self.connected:
