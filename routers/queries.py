@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
-from typing import Annotated, List
+from typing import List, Optional, Dict, Any, Annotated
 
 from datetime import datetime
 import time
@@ -10,53 +10,40 @@ from services.llm import LLMService
 from services.query import QueryService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
-from dependencies import get_db_service, get_llm_service, get_sharing_service, get_billing_service
+from dependencies import (
+    get_db_service, 
+    get_llm_service, 
+    get_sharing_service, 
+    get_billing_service,
+    get_mongodb_service,
+    verify_token
+)
 
 router = APIRouter(prefix="/queries", tags=["queries"])
 
 def get_query_service(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
-    billing_service: Annotated[BillingService, Depends(get_billing_service)]
+    billing_service: Annotated[BillingService, Depends(get_billing_service)],
+    mongodb_service: Annotated[Any, Depends(get_mongodb_service)]
 ) -> QueryService:
     """Get a fresh query service instance with current service states"""
     # Always create a fresh instance to ensure we have the latest service states
-    return QueryService(db_service, llm_service, billing_service)
+    return QueryService(db_service, llm_service, billing_service, mongodb_service)
 
 @router.post("/process", response_model=QueryResult, responses={400: {"model": ErrorResponse}})
 async def process_natural_language_query(
     query_request: QueryRequest,
-    db_service: Annotated[DatabaseService, Depends(get_db_service)],
-    llm_service: Annotated[LLMService, Depends(get_llm_service)],
-    billing_service: Annotated[BillingService, Depends(get_billing_service)]
-):
+    query_service: Annotated[QueryService, Depends(get_query_service)],
+    current_user: Annotated[str, Depends(verify_token)]
+) -> Any:
     """Process a natural language query and return SQL results"""
     try:
-        # Check prerequisites before creating query service
-        if not db_service.is_connected():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database is not connected. Please connect to a database using /database/connect endpoint first."
-            )
-        
-        if not llm_service.is_configured():
-            config_details = llm_service.get_config_details()
-            detail_msg = "LLM is not configured. Please configure the LLM using /database/configure-llm endpoint first."
-            if config_details:
-                detail_msg += f" Current config: {config_details}"
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=detail_msg
-            )
-        
-        # Create query service with fresh references
-        query_service = QueryService(db_service, llm_service, billing_service)
-        
         result = query_service.process_query(
-            query_request.query,
-            query_request.max_tokens,
-            query_request.temperature,
-            user_id=query_request.user_id,
+            user_query=query_request.query,
+            max_tokens=query_request.max_tokens,
+            temperature=query_request.temperature,
+            user_id=current_user,
             session_id=query_request.session_id
         )
         return result
@@ -92,7 +79,9 @@ async def process_natural_language_query_batch(
     batch_request: BatchQueryRequest,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
-    billing_service: Annotated[BillingService, Depends(get_billing_service)]
+    billing_service: Annotated[BillingService, Depends(get_billing_service)],
+    mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     try:
         if not db_service.is_connected():
@@ -103,7 +92,7 @@ async def process_natural_language_query_batch(
 
         if not llm_service.is_configured():
             config_details = llm_service.get_config_details()
-            detail_msg = "LLM is not configured. Please configure the LLM using /database/configure-llm endpoint first."
+            detail_msg = "LLM is not configured. Please configure the LLM using /llm/configure endpoint first."
             if config_details:
                 detail_msg += f" Current config: {config_details}"
             raise HTTPException(
@@ -118,12 +107,12 @@ async def process_natural_language_query_batch(
             results: List[QueryResult] = [None] * len(batch_request.queries)
 
             def run_item(index: int, q):
-                service = QueryService(db_service, llm_service, billing_service)
+                service = QueryService(db_service, llm_service, billing_service, mongodb_service)
                 return service.process_query(
-                    q.query, 
-                    q.max_tokens, 
-                    q.temperature,
-                    user_id=q.user_id,
+                    user_query=q.query, 
+                    max_tokens=q.max_tokens, 
+                    temperature=q.temperature,
+                    user_id=current_user,
                     session_id=q.session_id
                 )
 
@@ -136,14 +125,14 @@ async def process_natural_language_query_batch(
                     idx = future_map[future]
                     results[idx] = future.result()
         else:
-            query_service = QueryService(db_service, llm_service, billing_service)
+            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service)
             results: List[QueryResult] = []
             for item in batch_request.queries:
                 res = query_service.process_query(
-                    item.query,
-                    item.max_tokens,
-                    item.temperature,
-                    user_id=item.user_id,
+                    user_query=item.query,
+                    max_tokens=item.max_tokens,
+                    temperature=item.temperature,
+                    user_id=current_user,
                     session_id=item.session_id
                 )
                 results.append(res)
@@ -165,7 +154,8 @@ async def process_natural_language_query_batch(
 @router.get("/check-prerequisites", response_model=dict)
 async def check_prerequisites(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Check if all prerequisites are met for query processing"""
     db_connected = db_service.is_connected()
@@ -185,6 +175,7 @@ async def check_prerequisites(
         "llm_configured": llm_configured,
         "llm_config": llm_service.get_config_details(),
         "issues": issues,
+        "user_identity": current_user,
         "ready_for_queries": db_connected and llm_configured
     }
 
@@ -194,16 +185,17 @@ async def process_and_share_query(
     share_request: ShareRequest,
     request: Request,
     query_service: Annotated[QueryService, Depends(get_query_service)],
-    sharing_service: Annotated[SharingService, Depends(get_sharing_service)]
+    sharing_service: Annotated[SharingService, Depends(get_sharing_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Process a natural language query and immediately share the result"""
     try:
         # Process the query
         result = query_service.process_query(
-            query_request.query,
-            query_request.max_tokens,
-            query_request.temperature,
-            user_id=query_request.user_id,
+            user_query=query_request.query,
+            max_tokens=query_request.max_tokens,
+            temperature=query_request.temperature,
+            user_id=current_user,
             session_id=query_request.session_id
         )
         
@@ -252,6 +244,7 @@ async def process_and_share_query(
 @router.get("/history", response_model=List[QueryResult])
 async def get_query_history(
     query_service: Annotated[QueryService, Depends(get_query_service)],
+    current_user: Annotated[str, Depends(verify_token)],
     limit: int = 10
 ):
     """Get query history"""
@@ -263,7 +256,8 @@ async def share_historical_query(
     share_request: ShareRequest,
     request: Request,
     query_service: Annotated[QueryService, Depends(get_query_service)],
-    sharing_service: Annotated[SharingService, Depends(get_sharing_service)]
+    sharing_service: Annotated[SharingService, Depends(get_sharing_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Share a query result from history by index"""
     try:
@@ -292,7 +286,8 @@ async def share_historical_query(
 
 @router.delete("/history", response_model=dict)
 async def clear_query_history(
-    query_service: Annotated[QueryService, Depends(get_query_service)]
+    query_service: Annotated[QueryService, Depends(get_query_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Clear query history"""
     query_service.clear_history()

@@ -5,9 +5,12 @@ from datetime import datetime
 class DatabaseConnection(BaseModel):
     host: str = Field(..., description="Database host address")
     port: str = Field(..., description="Database port")
-    database: str = Field(..., description="Database name")
+    database: Optional[str] = Field(None, description="Database name")
     user: str = Field(..., description="Database username")
     password: str = Field(..., description="Database password")
+
+class DatabaseSelect(BaseModel):
+    database: str = Field(..., description="Database name to switch to")
 
 class ConnectionResponse(BaseModel):
     status: str = Field(..., description="Connection status")
@@ -59,6 +62,7 @@ class HealthCheck(BaseModel):
     status: str = Field(..., description="API status")
     database_connected: bool = Field(..., description="Database connection status")
     llm_configured: bool = Field(..., description="LLM configuration status")
+    mongodb_connected: bool = Field(..., description="MongoDB connection status")
     timestamp: datetime = Field(..., description="Check timestamp")
 
 class ShareRequest(BaseModel):

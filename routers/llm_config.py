@@ -2,15 +2,17 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Annotated
 from pydantic import BaseModel, Field
 
+from config import settings
 from services.llm import LLMService
-from dependencies import get_llm_service
+from dependencies import get_llm_service, verify_token
+from typing import Optional
 
 router = APIRouter(prefix="/llm", tags=["llm-config"])
 
 class LLMConfigRequest(BaseModel):
-    api_key: str = Field(..., description="Krutim AI API key")
-    api_base: str = Field("https://api.krutim.ai/v1", description="Krutim AI API base URL")
-    model: str = Field("llama-3-70b-instruct", description="Model name")
+    api_key: Optional[str] = Field(None, description="Krutim AI API key (falls back to .env if not provided)")
+    api_base: Optional[str] = Field(None, description="Krutim AI API base URL (falls back to .env if not provided)")
+    model: Optional[str] = Field(None, description="Model name (falls back to .env if not provided)")
 
 class LLMConfigResponse(BaseModel):
     status: str = Field(..., description="Configuration status")
@@ -20,21 +22,27 @@ class LLMConfigResponse(BaseModel):
 @router.post("/configure", response_model=LLMConfigResponse, responses={400: {"model": dict}})
 async def configure_llm(
     config: LLMConfigRequest,
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Configure the LLM service with Krutim AI credentials"""
     try:
+        # Fallback logic
+        api_key = config.api_key or settings.krutim_cloud_api_key or settings.openai_api_key
+        api_base = config.api_base or settings.openai_api_base
+        model = config.model or settings.llm_model_name
+
         success = llm_service.configure(
-            api_key=config.api_key,
-            base_url=config.api_base,
-            model=config.model
+            api_key=api_key,
+            base_url=api_base,
+            model=model
         )
         
         if success:
             return LLMConfigResponse(
                 status="success",
                 message="LLM configured successfully",
-                model=config.model
+                model=model
             )
         else:
             raise HTTPException(
@@ -54,14 +62,15 @@ async def get_llm_status(
 ):
     """Get current LLM configuration status"""
     if llm_service.is_configured():
+        config = llm_service.get_config_details()
         return LLMConfigResponse(
             status="configured",
             message="LLM is configured and ready to use",
-            model="llama-3-70b-instruct"  # This would ideally come from the service
+            model=config.get("model", "unknown") if config else "unknown"
         )
     else:
         return LLMConfigResponse(
             status="not_configured",
-            message="LLM is not configured. Please configure it first.",
+            message=f"LLM is not configured. (Using model: {settings.llm_model_name})",
             model="none"
         )

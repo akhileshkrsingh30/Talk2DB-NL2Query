@@ -58,7 +58,7 @@ class LLMService:
             print(f"API Key test failed with exception: {e}")
             return False  # Conservative approach
         
-    def configure(self, api_key: str, base_url: str = None, model: str = None, headers: Optional[Dict[str, str]] = None) -> bool:
+    def configure(self, api_key: str, base_url: str = None, model: str = None, headers: Optional[Dict[str, str]] = None, validate_key: bool = True) -> bool:
         """Configure LLM service"""
         try:
             if not api_key or api_key.strip() == "":
@@ -81,8 +81,8 @@ class LLMService:
             if headers:
                 print(f"   Custom headers: {list(headers.keys())}")
             
-            # Test the API key first
-            if not self.test_api_key(api_key, base_url, model, headers):
+            # Test the API key first (unless bypassed)
+            if validate_key and not self.test_api_key(api_key, base_url, model, headers):
                 raise ValueError(self.last_error or "Invalid API key or connection failed. Please check your credentials and network access.")
             
             # Store configuration details
@@ -114,14 +114,40 @@ class LLMService:
             print(f"LLM configuration failed: {str(e)}")
             raise RuntimeError(f"LLM configuration failed: {str(e)}")
     
+    def _attempt_auto_configure(self):
+        """Attempt to auto-configure using environment variables if not already configured"""
+        if self.configured and self.llm is not None:
+            return
+
+        import os
+        from config import settings
+        
+        # Priority: Settings -> os.environ
+        api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY") or os.getenv("KRUTIM_CLOUD_API_KEY")
+        
+        if api_key and api_key.strip():
+            try:
+                print(f"Lazy-configuring LLM from environment...")
+                self.configure(
+                    api_key=api_key,
+                    base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE"),
+                    model=settings.llm_model_name or os.getenv("LLM_MODEL_NAME") or "gpt-5.2",
+                    validate_key=False
+                )
+            except Exception as e:
+                print(f"Lazy-configuration failed: {e}")
+
     def is_configured(self) -> bool:
-        """Check if LLM is configured"""
+        """Check if LLM is configured (with lazy-load attempt)"""
+        if not self.configured or self.llm is None:
+            self._attempt_auto_configure()
         return self.configured and self.llm is not None
     
     def get_llm(self):
-        """Get LLM instance"""
+        """Get LLM instance (with lazy-load attempt)"""
         if not self.is_configured():
-            raise RuntimeError("LLM not configured. Please configure the LLM service first.")
+            # is_configured calls _attempt_auto_configure
+            raise RuntimeError("LLM not configured. Please configure the LLM using /llm/configure endpoint first.")
         return self.llm
     
     def get_config_details(self) -> Optional[Dict[str, Any]]:
@@ -142,9 +168,11 @@ class LLMService:
             
         prompt = ChatPromptTemplate.from_template(
             """You are a PostgreSQL expert. Generate syntactically correct SQL for the following question.
-            Return only SQL. Use these tables: {table_info}
+            Return only SQL. Use this database schema:
+            {schema_info}
+
             Question: {Question}
-            schema_info: {schema_info}
+
             CRITICAL RULES:
             - Use ONLY the exact column names provided in the schema above
             - Do NOT use generic column names like "date"; verify the exact column name from the schema
@@ -162,23 +190,18 @@ class LLMService:
             raise RuntimeError("LLM not configured. Cannot create explanation chain.")
             
         return ChatPromptTemplate.from_template(
-    """You are a PostgreSQL expert. Generate syntactically correct SQL for the following question.
-    Return only SQL. Use these tables:
+            """You are a helpful data assistant. Given a user's question, the database schema, and the results of a SQL query, provide a clear and concise natural language explanation of the results.
 
-    Question: {Question}
-    schema_info: {schema_info}
-    CRITICAL RULES:
-    - Use ONLY the exact column names provided in the table schema above
-    - Double-check that every column referenced exists in the schema
-    - Use proper PostgreSQL syntax
-    - For date/timestamp columns, verify the exact column name from the schema
-    - Common date column names: order_date, created_at, date, timestamp
-    - If a column doesn't exist, use the closest matching column from the schema
-    - Return only the SQL query, no explanations or markdown
-    - Do not assume column names - only use columns explicitly listed in the schema
-    
-    Example corrections:
-    - If schema has "order_date" instead of "date", use "order_date"
-    - If schema has "created_at" instead of "date", use "created_at"
-    """
-) | self.llm | StrOutputParser()
+            User's Question: {Question}
+            Database Schema: {schema_info}
+            Query Results: {results}
+
+            Instructions:
+            1. Provide a direct, professional, and conversational answer to the user's question.
+            2. CRITICAL: Do NOT use any Markdown formatting. No asterisks (**), no hashtags (#), no backticks (`), and no bolding symbols.
+            3. Use standard sentence case and normal punctuation.
+            4. If the data results are empty, state clearly that no records were found.
+            5. Present any lists using simple numbers (1., 2.) or bullet points (- ) that are readable as plain text.
+            6. The summary should be easy to read in any plain text application.
+            """
+        ) | self.llm | StrOutputParser()

@@ -1,28 +1,31 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Annotated
 from pydantic import BaseModel, Field
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from datetime import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from schemas import DatabaseConnection, ConnectionResponse, DatabaseSchema, ErrorResponse, SQLBatchRequest, SQLBatchResult
+from config import settings
+from schemas import DatabaseConnection, DatabaseSelect, ConnectionResponse, DatabaseSchema, ErrorResponse, SQLBatchRequest, SQLBatchResult
 from services.database import DatabaseService, convert_realdict_to_dict
 from services.llm import LLMService
-from dependencies import get_db_service, get_llm_service
+from dependencies import get_db_service, get_llm_service, verify_token
 
 router = APIRouter(prefix="/database", tags=["database"])
 
 class LLMConfigRequest(BaseModel):
-    api_key: str = Field(..., description="API key for LLM service")
-    api_base: str = Field("https://cloud.olakrutrim.com/v1", description="API base URL")
-    model: str = Field("Llama-3.3-70B-Instruct", description="Model name")
+    api_key: Optional[str] = Field(None, description="API key for LLM service (falls back to .env if not provided)")
+    api_base: Optional[str] = Field(None, description="API base URL (falls back to .env if not provided)")
+    model: Optional[str] = Field(None, description="Model name (falls back to .env if not provided)")
     headers: Optional[Dict[str, str]] = Field(None, description="Optional extra headers to send to the provider")
 
 @router.post("/connect", response_model=ConnectionResponse, responses={400: {"model": ErrorResponse}})
 async def connect_to_database(
     connection: DatabaseConnection,
-    db_service: Annotated[DatabaseService, Depends(get_db_service)]
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Connect to a PostgreSQL database"""
     try:
@@ -37,9 +40,23 @@ async def connect_to_database(
         success = db_service.connect(connection_params)
         
         if success:
+            # When database connects, also ensure LLM is configured if it isn't already
+            if not llm_service.is_configured():
+                api_key = settings.krutim_cloud_api_key or settings.openai_api_key
+                if api_key and api_key.strip():
+                    try:
+                        llm_service.configure(
+                            api_key=api_key,
+                            base_url=settings.openai_api_base or (None if settings.openai_api_key else "https://api.krutim.ai/v1"),
+                            model=settings.llm_model_name,
+                            validate_key=False
+                        )
+                    except Exception as e:
+                        print(f"Automatic LLM configuration failed during DB connect: {e}")
+
             return ConnectionResponse(
                 status="success",
-                message="Connected to database successfully",
+                message="Connected to database successfully (and LLM configured)",
                 version=db_service.get_db_version(),
                 details={
                     "host": connection.host,
@@ -61,15 +78,67 @@ async def connect_to_database(
 
 @router.post("/disconnect", response_model=dict)
 async def disconnect_database(
-    db_service: Annotated[DatabaseService, Depends(get_db_service)]
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Disconnect from database"""
     db_service.disconnect()
     return {"message": "Disconnected from database"}
 
+@router.get("/list", response_model=Dict[str, Any])
+async def list_databases(
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
+):
+    """List all databases available on the server"""
+    try:
+        databases = db_service.get_databases()
+        return {
+            "status": "success",
+            "databases": databases
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+@router.post("/select", response_model=ConnectionResponse)
+async def select_database(
+    selection: DatabaseSelect,
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
+):
+    """Switch to a specific database after listing them"""
+    try:
+        success = db_service.select_database(selection.database)
+        if success:
+            params = db_service.get_connection_params()
+            return ConnectionResponse(
+                status="success",
+                message=f"Switched to database '{selection.database}' successfully",
+                version=db_service.get_db_version(),
+                details={
+                    "host": params["host"],
+                    "database": params["database"],
+                    "user": params["user"]
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to switch to database '{selection.database}'"
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
 @router.get("/schema", response_model=DatabaseSchema, responses={400: {"model": ErrorResponse}})
 async def get_database_schema(
-    db_service: Annotated[DatabaseService, Depends(get_db_service)]
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Get database schema information"""
     try:
@@ -91,7 +160,8 @@ async def get_database_schema(
 
 @router.get("/status", response_model=ConnectionResponse)
 async def get_database_status(
-    db_service: Annotated[DatabaseService, Depends(get_db_service)]
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Get current database connection status"""
     if db_service.is_connected():
@@ -110,13 +180,14 @@ async def get_database_status(
     else:
         return ConnectionResponse(
             status="disconnected",
-            message="Database is not connected"
+            message=f"Database is not connected. (Configured for {settings.db_host or 'none'})"
         )
 
 @router.post("/test-llm-connection", response_model=dict)
 async def test_llm_connection(
     config: LLMConfigRequest,
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Test LLM connection without configuring the service"""
     try:
@@ -149,17 +220,23 @@ async def test_llm_connection(
 @router.post("/configure-llm", response_model=dict)
 async def configure_llm(
     config: LLMConfigRequest,
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Configure the LLM service"""
     try:
         # Reset any existing configuration first
         llm_service.reset_configuration()
         
+        # Use provided value or fall back to settings
+        api_key = config.api_key or settings.krutim_cloud_api_key or settings.openai_api_key
+        api_base = config.api_base or settings.openai_api_base
+        model = config.model or settings.llm_model_name
+        
         success = llm_service.configure(
-            api_key=config.api_key,
-            base_url=config.api_base,
-            model=config.model,
+            api_key=api_key,
+            base_url=api_base,
+            model=model,
             headers=config.headers
         )
         
@@ -196,19 +273,23 @@ async def configure_llm(
 
 @router.get("/llm-status", response_model=dict)
 async def get_llm_status(
-    llm_service: Annotated[LLMService, Depends(get_llm_service)]
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     """Get current LLM configuration status"""
+    details = llm_service.get_config_details() or {}
     return {
         "configured": llm_service.is_configured(),
-        "config_details": llm_service.get_config_details(),
+        "config_details": details,
+        "model": details.get("model", settings.llm_model_name),
         "status": "configured" if llm_service.is_configured() else "not_configured"
     }
 
 @router.post("/execute-sql-batch", response_model=SQLBatchResult, responses={400: {"model": ErrorResponse}})
 async def execute_sql_batch(
     batch: SQLBatchRequest,
-    db_service: Annotated[DatabaseService, Depends(get_db_service)]
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
 ):
     try:
         if not db_service.is_connected():

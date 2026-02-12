@@ -1,6 +1,8 @@
-from fastapi import Depends, HTTPException, status
-from typing import Annotated
+from fastapi import Depends, HTTPException, status, Header
+from typing import Annotated, Optional
 import psycopg2
+import requests
+import re
 from psycopg2.extras import RealDictCursor
 
 from services.registry import service_registry
@@ -8,6 +10,9 @@ from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
+from services.mongodb import MongoDBService
+from config import settings
+import os
 
 def get_db_service() -> DatabaseService:
     """Dependency to get database service instance"""
@@ -22,7 +27,21 @@ def get_db_service() -> DatabaseService:
 def get_llm_service() -> LLMService:
     """Dependency to get LLM service instance"""
     try:
-        return service_registry.get_llm_service()
+        service = service_registry.get_llm_service()
+        # Proactive auto-configuration if not already configured
+        if not service.is_configured():
+            api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY")
+            if api_key and api_key.strip():
+                try:
+                    service.configure(
+                        api_key=api_key,
+                        base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE"),
+                        model=settings.llm_model_name,
+                        validate_key=False
+                    )
+                except Exception:
+                    pass # Fail silently, let the endpoint handle the error
+        return service
     except RuntimeError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -79,3 +98,59 @@ def get_llm(
             detail="LLM not configured. Please check API key."
         )
     return llm_service.get_llm()
+
+def get_mongodb_service() -> MongoDBService:
+    """Dependency to get MongoDB service instance"""
+    try:
+        return service_registry.get_mongodb_service()
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+def verify_token(authorization: Annotated[Optional[str], Header()] = None) -> str:
+    """
+    Validate token with external API and extract identity.
+    Flow: Backend forwards JWT -> External API -> Parse Identity
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token is missing!"
+        )
+    
+    try:
+        # Validate token with external API
+        response = requests.get(
+            settings.auth_api_url, 
+            headers={"Authorization": authorization},
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid or expired token"
+            )
+
+        # Extract identity from API response
+        # Format: "Hello, jyoti.raut@softelnetworks.com! This is a protected API."
+        match = re.search(r"Hello, (.+?)! This is a protected API", response.text)
+        if not match:
+            # If the format is slightly different, we try to preserve the username
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Failed to parse identity from auth service"
+            )
+        
+        username = match.group(1)
+        return username
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token validation failed: {str(e)}"
+        )

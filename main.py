@@ -1,16 +1,25 @@
+import sys
+import io
 from fastapi import FastAPI, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+# Force UTF-8 encoding for Windows terminals to prevent 'charmap' codec errors
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 from config import settings
-from routers import database, queries, sharing
+from routers import database, queries, sharing, llm_config
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
+from services.mongodb import MongoDBService
 from services.registry import service_registry
 from schemas import HealthCheck
+from dependencies import verify_token
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,40 +30,51 @@ async def lifespan(app: FastAPI):
     llm_service = LLMService()
     sharing_service = SharingService()
     billing_service = BillingService()
+    mongodb_service = MongoDBService()
     
     # Register services in the registry
     service_registry.set_db_service(db_service)
     service_registry.set_llm_service(llm_service)
     service_registry.set_sharing_service(sharing_service)
     service_registry.set_billing_service(billing_service)
+    service_registry.set_mongodb_service(mongodb_service)
     
+    # Try to connect to database from environment variables
+    if all([settings.db_host, settings.db_port, settings.db_name, settings.db_user]):
+        try:
+            print(f"Connecting to database {settings.db_name} at {settings.db_host}...")
+            db_service.connect({
+                "host": settings.db_host,
+                "port": settings.db_port,
+                "database": settings.db_name,
+                "user": settings.db_user,
+                "password": settings.db_password
+            })
+            print("Database connected successfully")
+        except Exception as e:
+            print(f"Database auto-connection failed: {e}")
+
     # Try to configure LLM from environment variables
-    if settings.krutim_cloud_api_key and settings.krutim_cloud_api_key.strip():
+    # Use Krutim if key is provided, otherwise fallback to OpenAI
+    # Try settings first, then direct os.environ fallback
+    import os
+    api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY") or os.getenv("KRUTIM_CLOUD_API_KEY")
+    
+    if api_key and api_key.strip():
         try:
-            print("Configuring LLM from environment variables (Krutim)...")
+            print(f"Auto-Configuring LLM (Primary key detected: {api_key[:10]}...)")
+            # Use direct configuration to avoid the overhead/latency of the test-ping during startup
             llm_service.configure(
-                api_key=settings.krutim_cloud_api_key,
-                base_url=settings.openai_api_base,
-                model=settings.llm_model_name
+                api_key=api_key,
+                base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE") or (None if (settings.openai_api_key or os.getenv("OPENAI_API_KEY")) else "https://api.krutim.ai/v1"),
+                model=settings.llm_model_name,
+                validate_key=False  # Bypass validation for instant startup
             )
-            print("LLM configured successfully from environment variables")
+            print(f"✓ LLM configured successfully (Model: {settings.llm_model_name})")
         except Exception as e:
-            print(f"LLM configuration failed: {e}")
-            print("LLM can be configured later using the /database/configure-llm endpoint")
-    elif settings.openai_api_key and settings.openai_api_key.strip():
-        try:
-            print("Configuring LLM from environment variables (OpenAI)...")
-            llm_service.configure(
-                api_key=settings.openai_api_key,
-                base_url=settings.openai_api_base,
-                model=settings.llm_model_name
-            )
-            print("LLM configured successfully from environment variables")
-        except Exception as e:
-            print(f"LLM configuration failed: {e}")
-            print("LLM can be configured later using the /database/configure-llm endpoint")
+            print(f"✗ LLM auto-configuration failed: {e}")
     else:
-        print("No API key found in environment. LLM can be configured using the /database/configure-llm endpoint")
+        print("✗ No LLM API key found in environment variables or .env file.")
     
     print("Services initialized successfully")
     yield
@@ -68,14 +88,15 @@ app = FastAPI(
     title=settings.app_title,
     description=settings.app_description,
     version=settings.app_version,
-    lifespan=lifespan
+    lifespan=lifespan,
+    dependencies=[Depends(verify_token)]
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -84,6 +105,7 @@ app.add_middleware(
 app.include_router(database.router)
 app.include_router(queries.router)
 app.include_router(sharing.router)
+app.include_router(llm_config.router)
 
 @app.get("/", include_in_schema=False)
 async def root():
@@ -95,11 +117,13 @@ async def health_check():
     try:
         db_service = service_registry.get_db_service()
         llm_service = service_registry.get_llm_service()
+        mongodb_service = service_registry.get_mongodb_service()
         
         return HealthCheck(
             status="healthy",
             database_connected=db_service.is_connected(),
             llm_configured=llm_service.is_configured(),
+            mongodb_connected=mongodb_service.is_connected(),
             timestamp=datetime.now()
         )
     except Exception:
@@ -107,6 +131,7 @@ async def health_check():
             status="unhealthy",
             database_connected=False,
             llm_configured=False,
+            mongodb_connected=False,
             timestamp=datetime.now()
         )
 
