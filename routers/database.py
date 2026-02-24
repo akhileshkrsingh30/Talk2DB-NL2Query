@@ -10,7 +10,8 @@ from config import settings
 from schemas import DatabaseConnection, DatabaseSelect, ConnectionResponse, DatabaseSchema, ErrorResponse, SQLBatchRequest, SQLBatchResult
 from services.database import DatabaseService, convert_realdict_to_dict
 from services.llm import LLMService
-from dependencies import get_db_service, get_llm_service, verify_token
+from services.mongodb import MongoDBService
+from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service
 
 router = APIRouter(prefix="/database", tags=["database"])
 
@@ -25,6 +26,7 @@ async def connect_to_database(
     connection: DatabaseConnection,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Connect to a PostgreSQL database"""
@@ -57,6 +59,13 @@ async def connect_to_database(
                         )
                     except Exception as e:
                         print(f"Automatic LLM configuration failed during DB connect: {e}")
+
+            # NEW: Push schema to MongoDB on successful connection
+            try:
+                schema_dict = db_service.get_schema_dict()
+                mongodb_service.push_postgres_schema(schema_dict)
+            except Exception as e:
+                print(f"Failed to auto-push schema to MongoDB: {e}")
 
             return ConnectionResponse(
                 status="success",
@@ -146,12 +155,20 @@ async def list_databases(
 async def select_database(
     selection: DatabaseSelect,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Switch to a specific database after listing them"""
     try:
         success = db_service.select_database(selection.database)
         if success:
+            # NEW: Push schema to MongoDB on successful selection
+            try:
+                schema_dict = db_service.get_schema_dict()
+                mongodb_service.push_postgres_schema(schema_dict)
+            except Exception as e:
+                print(f"Failed to auto-push schema to MongoDB: {e}")
+
             params = db_service.get_connection_params()
             return ConnectionResponse(
                 status="success",

@@ -470,3 +470,60 @@ class MongoDBService:
         except Exception as e:
             print(f"Error getting shared result: {e}")
             return None
+    def push_postgres_schema(self, schema_data: Dict[str, Any]) -> str:
+        """Push a PostgreSQL schema definition into MongoDB with Smart Update (Upsert)"""
+        try:
+            if self.client is None:
+                self._legacy_connect()
+                
+            if self.client is None:
+                print("Cannot push schema: MongoDB not connected.")
+                return None
+                
+            source_db = self.client["metadata_store"]
+            schema_collection = source_db["postgres_schemas"]
+            
+            host = schema_data.get("host")
+            db_name = schema_data.get("database")
+            current_schemas = schema_data.get("schemas", {})
+            
+            # Find if this database already has an entry
+            existing = schema_collection.find_one({"host": host, "database": db_name})
+            
+            now = datetime.now()
+            
+            if existing:
+                # Compare the actual schema structure
+                if existing.get("schemas") == current_schemas:
+                    # SCHEMA UNCHANGED: Just update last_seen
+                    schema_collection.update_one(
+                        {"_id": existing["_id"]},
+                        {"$set": {"last_seen": now}}
+                    )
+                    print(f"✓ Schema for '{db_name}' unchanged. Updated last_seen timestamp in MongoDB.")
+                    return str(existing["_id"])
+                else:
+                    # SCHEMA CHANGED: Replace with new content and increment version
+                    schema_data["updated_at"] = now
+                    schema_data["last_seen"] = now
+                    schema_data["version"] = existing.get("version", 1) + 1
+                    
+                    # Ensure we don't carry the old timestamp in comparison again later
+                    # (Though we compare 'schemas' key specifically above)
+                    
+                    schema_collection.replace_one({"_id": existing["_id"]}, schema_data)
+                    print(f"⚠ Schema change detected for '{db_name}'! Updated record to version {schema_data['version']} in MongoDB.")
+                    return str(existing["_id"])
+            else:
+                # NEW DATABASE: Create first entry
+                schema_data["created_at"] = now
+                schema_data["last_seen"] = now
+                schema_data["version"] = 1
+                
+                result = schema_collection.insert_one(schema_data)
+                print(f"✓ New entry: Pushed initial PostgreSQL schema for '{db_name}' to MongoDB.")
+                return str(result.inserted_id)
+                
+        except Exception as e:
+            print(f"Failed to push postgres schema to MongoDB: {e}")
+            return None
