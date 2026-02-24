@@ -107,14 +107,30 @@ async def process_natural_language_query_batch(
             results: List[QueryResult] = [None] * len(batch_request.queries)
 
             def run_item(index: int, q):
-                service = QueryService(db_service, llm_service, billing_service, mongodb_service)
-                return service.process_query(
-                    user_query=q.query, 
-                    max_tokens=q.max_tokens, 
-                    temperature=q.temperature,
-                    user_id=current_user,
-                    session_id=q.session_id
-                )
+                try:
+                    service = QueryService(db_service, llm_service, billing_service, mongodb_service)
+                    return service.process_query(
+                        user_query=q.query, 
+                        max_tokens=q.max_tokens, 
+                        temperature=q.temperature,
+                        user_id=current_user,
+                        session_id=q.session_id
+                    )
+                except Exception as e:
+                    # Return a partial failure result instead of crashing
+                    return QueryResult(
+                        query=q.query,
+                        sql_queries=[],
+                        results=[],
+                        explanation=f"Error processing this query: {str(e)}",
+                        timestamp=datetime.now(),
+                        execution_time=0.0,
+                        input_tokens=0,
+                        output_tokens=0,
+                        total_tokens=0,
+                        user_id=current_user,
+                        session_id=q.session_id
+                    )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
@@ -128,14 +144,24 @@ async def process_natural_language_query_batch(
             query_service = QueryService(db_service, llm_service, billing_service, mongodb_service)
             results: List[QueryResult] = []
             for item in batch_request.queries:
-                res = query_service.process_query(
-                    user_query=item.query,
-                    max_tokens=item.max_tokens,
-                    temperature=item.temperature,
-                    user_id=current_user,
-                    session_id=item.session_id
-                )
-                results.append(res)
+                try:
+                    res = query_service.process_query(
+                        user_query=item.query,
+                        max_tokens=item.max_tokens,
+                        temperature=item.temperature,
+                        user_id=current_user,
+                        session_id=item.session_id
+                    )
+                    results.append(res)
+                except Exception as e:
+                    results.append(QueryResult(
+                        query=item.query,
+                        sql_queries=[],
+                        results=[],
+                        explanation=f"Error processing query: {str(e)}",
+                        timestamp=datetime.now(),
+                        execution_time=0.0
+                    ))
 
         total_time = time.time() - start_time
         return BatchQueryResult(

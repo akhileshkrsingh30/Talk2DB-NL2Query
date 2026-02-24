@@ -5,7 +5,7 @@ from datetime import datetime
 class DatabaseConnection(BaseModel):
     host: str = Field(..., description="Database host address")
     port: str = Field(..., description="Database port")
-    database: Optional[str] = Field(None, description="Database name")
+    database: Optional[str] = Field(None, description="Database name (optional, defaults to 'postgres' if not provided)")
     user: str = Field(..., description="Database username")
     password: str = Field(..., description="Database password")
 
@@ -112,3 +112,67 @@ class SQLBatchResult(BaseModel):
     results: List[SQLBatchItem]
     timestamp: datetime
     execution_time: Optional[float] = None
+
+# ============================================================================
+# MongoDB Schemas
+# ============================================================================
+
+class MongoDBConnection(BaseModel):
+    host: str = Field(..., description="MongoDB host address")
+    port: str = Field("27017", description="MongoDB port (default: 27017)")
+    database: Optional[str] = Field(None, description="Database name (optional, defaults to 'admin' if not provided)")
+    username: Optional[str] = Field(None, description="MongoDB username (optional)")
+    password: Optional[str] = Field(None, description="MongoDB password (optional)")
+    auth_source: Optional[str] = Field("admin", description="Authentication database (default: admin)")
+    auth_mechanism: Optional[str] = Field(None, description="Authentication mechanism (e.g., SCRAM-SHA-256)")
+
+class MongoDBSelect(BaseModel):
+    database: str = Field(..., description="Database name to switch to")
+
+class MongoDBCollectionSelect(BaseModel):
+    collection: str = Field(..., description="Collection name to switch to")
+
+class MongoDBConnectionResponse(BaseModel):
+    status: str = Field(..., description="Connection status")
+    message: str = Field(..., description="Detailed message")
+    server_info: Optional[Dict[str, Any]] = Field(None, description="MongoDB server information")
+    details: Optional[Dict[str, str]] = Field(None, description="Connection details")
+
+class MongoDBDatabaseList(BaseModel):
+    status: str = Field(..., description="Status of the operation")
+    databases: List[str] = Field(..., description="List of database names")
+    count: int = Field(..., description="Number of databases")
+
+class MongoDBCollectionList(BaseModel):
+    status: str = Field(..., description="Status of the operation")
+    collections: List[str] = Field(..., description="List of collection names")
+    count: int = Field(..., description="Number of collections")
+    database: str = Field(..., description="Current database name")
+
+class MongoDBQueryRequest(BaseModel):
+    query: str = Field(..., description="Natural language query for MongoDB")
+    max_tokens: Optional[int] = Field(1024, description="Maximum tokens for LLM response")
+    temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
+    session_id: Optional[str] = Field(None, description="Optional session identifier")
+
+class MongoDBQueryResult(BaseModel):
+    query: str = Field(..., description="Original natural language query")
+    mongo_query: Dict[str, Any] = Field(..., description="Generated MongoDB query")
+    results: List[Dict[str, Any]] = Field(..., description="Query execution results")
+    result_count: int = Field(..., description="Number of results returned")
+    explanation: str = Field(..., description="Natural language explanation of results")
+    collection: str = Field(..., description="Collection queried")
+    database: str = Field(..., description="Database queried")
+    timestamp: datetime = Field(..., description="When the query was executed")
+    execution_time: Optional[float] = Field(None, description="Execution time in seconds")
+    input_tokens: Optional[int] = Field(None, description="Number of input tokens")
+    output_tokens: Optional[int] = Field(None, description="Number of output tokens")
+    total_tokens: Optional[int] = Field(None, description="Total number of tokens used")
+    user_id: Optional[str] = Field(None, description="User identifier")
+    session_id: Optional[str] = Field(None, description="Session identifier")
+
+    class Config:
+        extra = "allow"
+        json_encoders = {
+            datetime: lambda v: v.isoformat(),
+        }

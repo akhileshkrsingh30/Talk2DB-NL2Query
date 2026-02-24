@@ -205,3 +205,60 @@ class LLMService:
             6. The summary should be easy to read in any plain text application.
             """
         ) | self.llm | StrOutputParser()
+
+    def create_mongodb_chain(self):
+        """Create MongoDB query chain - generates MongoDB find queries from natural language"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured. Cannot create MongoDB chain.")
+            
+        prompt = ChatPromptTemplate.from_template(
+            """You are a MongoDB expert. Generate a valid MongoDB query for the following question.
+            The query will be used with PyMongo's find() method.
+
+            Collection Schema (sample document fields):
+            {schema_info}
+
+            Question: {Question}
+
+            CRITICAL RULES:
+            - Return ONLY a valid JSON object with two keys: "filter" and "projection"
+            - "filter" is the MongoDB query filter (the first argument to find())
+            - "projection" is the fields to return (the second argument to find()). Use 1 to include, 0 to exclude. Always exclude "_id" unless specifically asked.
+            - Use ONLY the exact field names from the schema above
+            - For geospatial queries, use native MongoDB operators like $near, $nearSphere, $geoWithin, or $geoIntersects if the schema contains 2dsphere indexes or coordinates. 
+            - If calculating distance manually via $expr, keep the formula as concise as possible to avoid truncation.
+            - For string matching, use $regex with $options: "i" for case-insensitive
+            - For numeric comparisons use $gt, $gte, $lt, $lte, $eq, $ne
+            - For sorting, add a "sort" key with field and direction (1=asc, -1=desc)
+            - For limiting results, add a "limit" key with an integer value
+            - Do NOT wrap the JSON in markdown code blocks or backticks
+            - Return ONLY the raw JSON object, nothing else
+            - ENSURE the JSON is complete and valid.
+
+            Example output:
+            {{"filter": {{"age": {{"$gt": 25}}}}, "projection": {{"name": 1, "age": 1, "_id": 0}}, "sort": {{"age": -1}}, "limit": 10}}
+            """
+        )
+        return prompt | self.llm | StrOutputParser()
+
+    def create_mongodb_explanation_chain(self):
+        """Create natural language explanation chain for MongoDB results"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured. Cannot create MongoDB explanation chain.")
+            
+        return ChatPromptTemplate.from_template(
+            """You are a helpful data assistant. Given a user's question, the collection schema, and the results of a MongoDB query, provide a clear and concise natural language explanation of the results.
+
+            User's Question: {Question}
+            Collection Schema: {schema_info}
+            Query Results: {results}
+
+            Instructions:
+            1. Provide a direct, professional, and conversational answer to the user's question.
+            2. CRITICAL: Do NOT use any Markdown formatting. No asterisks (**), no hashtags (#), no backticks (`), and no bolding symbols.
+            3. Use standard sentence case and normal punctuation.
+            4. If the data results are empty, state clearly that no records were found.
+            5. Present any lists using simple numbers (1., 2.) or bullet points (- ) that are readable as plain text.
+            6. The summary should be easy to read in any plain text application.
+            """
+        ) | self.llm | StrOutputParser()
