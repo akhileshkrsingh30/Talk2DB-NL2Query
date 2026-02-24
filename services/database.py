@@ -64,16 +64,29 @@ class DatabaseService:
     def connect(self, connection_params: Dict[str, Any]) -> bool:
         """Establish database connection"""
         try:
-            # Validate required parameters
+            # Validate required parameters (database is optional)
             required_fields = ["host", "port", "user", "password"]
-            if not all(connection_params.get(field) for field in required_fields):
-                raise ValueError(f"Required connection fields missing: {', '.join([f for f in required_fields if not connection_params.get(f)])}")
+            missing_fields = []
+            
+            for field in required_fields:
+                value = connection_params.get(field)
+                # Check if field is missing, None, or empty string
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    missing_fields.append(field)
+            
+            if missing_fields:
+                raise ValueError(f"Required connection fields missing or empty: {', '.join(missing_fields)}")
                 
-            if not str(connection_params["port"]).isdigit():
-                raise ValueError("Port must be a number")
+            # Validate port is numeric
+            port_value = str(connection_params["port"]).strip()
+            if not port_value.isdigit():
+                raise ValueError(f"Port must be a number, got: {port_value}")
                 
-            # Default to 'postgres' if no database name provided
-            db_name = connection_params.get("database") or "postgres"
+            # Default to 'postgres' if no database name provided (database is optional)
+            db_name = connection_params.get("database")
+            if not db_name or (isinstance(db_name, str) and not db_name.strip()):
+                db_name = "postgres"
+                print(f"No database specified, defaulting to 'postgres'")
                 
             # Test connection
             with psycopg2.connect(

@@ -11,7 +11,7 @@ if sys.platform == "win32":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 from config import settings
-from routers import database, queries, sharing, llm_config
+from routers import database, queries, sharing, llm_config, mongodb
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
@@ -103,6 +103,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(database.router)
+app.include_router(mongodb.router)
 app.include_router(queries.router)
 app.include_router(sharing.router)
 app.include_router(llm_config.router)

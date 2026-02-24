@@ -29,6 +29,10 @@ async def connect_to_database(
 ):
     """Connect to a PostgreSQL database"""
     try:
+        # Log the incoming connection request (without password)
+        print(f"Connection request - Host: {connection.host}, Port: {connection.port}, "
+              f"Database: {connection.database}, User: {connection.user}")
+        
         connection_params = {
             "host": connection.host,
             "port": connection.port,
@@ -60,7 +64,7 @@ async def connect_to_database(
                 version=db_service.get_db_version(),
                 details={
                     "host": connection.host,
-                    "database": connection.database,
+                    "database": connection.database or "postgres",
                     "user": connection.user
                 }
             )
@@ -70,10 +74,26 @@ async def connect_to_database(
                 detail="Failed to connect to database"
             )
             
-    except Exception as e:
+    except ValueError as e:
+        # Validation errors (missing fields, invalid port, etc.)
+        print(f"Validation error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
+            detail=f"Validation error: {str(e)}"
+        )
+    except ConnectionError as e:
+        # Database connection errors
+        print(f"Connection error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Connection error: {str(e)}"
+        )
+    except Exception as e:
+        # Other unexpected errors
+        print(f"Unexpected error during connection: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error: {str(e)}"
         )
 
 @router.post("/disconnect", response_model=dict)
@@ -92,15 +112,34 @@ async def list_databases(
 ):
     """List all databases available on the server"""
     try:
+        # Check if connected first
+        if not db_service.is_connected():
+            print("Error: Attempted to list databases without being connected")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Database not connected. Please connect first using /database/connect endpoint (you can omit the 'database' field to connect to the default 'postgres' database)."
+            )
+        
         databases = db_service.get_databases()
+        print(f"Successfully listed {len(databases)} databases")
         return {
             "status": "success",
-            "databases": databases
+            "databases": databases,
+            "count": len(databases)
         }
-    except Exception as e:
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        print(f"Runtime error listing databases: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
+        )
+    except Exception as e:
+        print(f"Unexpected error listing databases: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list databases: {str(e)}"
         )
 
 @router.post("/select", response_model=ConnectionResponse)
