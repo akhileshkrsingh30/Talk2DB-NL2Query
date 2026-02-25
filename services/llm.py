@@ -206,6 +206,58 @@ class LLMService:
             """
         ) | self.llm | StrOutputParser()
 
+    def create_table_search_mongodb_chain(self):
+        """Step 1: Generate a MongoDB query to find relevant tables from metadata"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured.")
+
+        prompt = ChatPromptTemplate.from_template(
+            """You are a database expert. Your task is to generate a MongoDB find() query to search for relevant tables in a PostgreSQL schema metadata collection.
+            
+            Metadata Collection Schema (collection: table_metadata):
+            - table: table name
+            - schema: schema name (usually 'public')
+            - database: database name
+            - host: host name
+            - column_names: array of strings (e.g., ["id", "name", "created_at"])
+            
+            User's Question: {Question}
+            
+            Instructions:
+            - Return ONLY a valid JSON object used as the filter for MongoDB find().
+            - The filter should use $or and $regex to search in both "table" and "column_names".
+            - Make the regex case-insensitive using $options: "i".
+            - Only return the raw JSON object.
+            
+            Example Output:
+            {{"$or": [{{"table": {{"$regex": "user", "$options": "i"}}}}, {{"column_names": {{"$regex": "email", "$options": "i"}}}}]}}
+            """
+        )
+        return prompt | self.llm | StrOutputParser()
+
+    def create_sql_generation_chain(self):
+        """Step 2: Generate final SQL from filtered schema context"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured.")
+
+        prompt = ChatPromptTemplate.from_template(
+            """You are a PostgreSQL expert. Generate syntactically correct SQL for the following question.
+            Use ONLY the tables and columns provided in the schema context below.
+            
+            Schema Context:
+            {schema_context}
+            
+            User's Question: {Question}
+            
+            CRITICAL RULES:
+            - Use ONLY the provided tables and columns.
+            - Ensure correct JOIN conditions.
+            - Use proper PostgreSQL syntax.
+            - Return only the SQL query, no markdown, no explanation.
+            """
+        )
+        return prompt | self.llm | StrOutputParser()
+
     def create_mongodb_chain(self):
         """Create MongoDB query chain - generates MongoDB find queries from natural language"""
         if not self.is_configured():
