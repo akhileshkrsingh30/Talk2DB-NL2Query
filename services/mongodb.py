@@ -470,3 +470,138 @@ class MongoDBService:
         except Exception as e:
             print(f"Error getting shared result: {e}")
             return None
+    def push_postgres_schema(self, schema_data: Dict[str, Any]) -> str:
+        """Push a PostgreSQL schema definition into MongoDB with Smart Update (Upsert)"""
+        try:
+            if self.client is None:
+                self._legacy_connect()
+                
+            if self.client is None:
+                print("Cannot push schema: MongoDB not connected.")
+                return None
+                
+            source_db = self.client["metadata_store"]
+            schema_collection = source_db["postgres_schemas"]
+            
+            host = schema_data.get("host")
+            db_name = schema_data.get("database")
+            current_schemas = schema_data.get("schemas", {})
+            
+            # Find if this database already has an entry
+            existing = schema_collection.find_one({"host": host, "database": db_name})
+            
+            now = datetime.now()
+            
+            if existing:
+                # Compare the actual schema structure
+                if existing.get("schemas") == current_schemas:
+                    # SCHEMA UNCHANGED: Just update last_seen
+                    schema_collection.update_one(
+                        {"_id": existing["_id"]},
+                        {"$set": {"last_seen": now}}
+                    )
+                    print(f"✓ Schema for '{db_name}' unchanged. Updated last_seen timestamp in MongoDB.")
+                    return str(existing["_id"])
+                else:
+                    # SCHEMA CHANGED: Replace with new content and increment version
+                    schema_data["updated_at"] = now
+                    schema_data["last_seen"] = now
+                    schema_data["version"] = existing.get("version", 1) + 1
+                    
+                    # Ensure we don't carry the old timestamp in comparison again later
+                    # (Though we compare 'schemas' key specifically above)
+                    
+                    schema_collection.replace_one({"_id": existing["_id"]}, schema_data)
+                    print(f"⚠ Schema change detected for '{db_name}'! Updated record to version {schema_data['version']} in MongoDB.")
+                    return str(existing["_id"])
+            else:
+                # NEW DATABASE: Create first entry
+                schema_data["created_at"] = now
+                schema_data["last_seen"] = now
+                schema_data["version"] = 1
+                
+                result = schema_collection.insert_one(schema_data)
+                print(f"✓ New entry: Pushed initial PostgreSQL schema for '{db_name}' to MongoDB.")
+                
+            # ALSO: Upsert individual table metadata for easier querying
+            table_metadata_coll = source_db["table_metadata"]
+            for schema_name, tables in current_schemas.items():
+                for table_name, columns in tables.items():
+                    table_metadata_coll.update_one(
+                        {"host": host, "database": db_name, "schema": schema_name, "table": table_name},
+                        {"$set": {
+                            "columns": columns,
+                            "last_updated": now,
+                            "column_names": [c["name"] for c in columns]
+                        }},
+                        upsert=True
+                    )
+            print(f"✓ Synced metadata for {sum(len(t) for t in current_schemas.values())} tables to 'table_metadata' collection.")
+            
+            return str(existing["_id"]) if existing else str(result.inserted_id)
+                
+        except Exception as e:
+            print(f"Failed to push postgres schema to MongoDB: {e}")
+            return None
+    def get_postgres_schema(self, host: str, database: str) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest PostgreSQL schema from MongoDB metadata store"""
+        try:
+            if self.client is None:
+                self._legacy_connect()
+            
+            if self.client is None:
+                return None
+                
+            source_db = self.client["metadata_store"]
+            schema_collection = source_db["postgres_schemas"]
+            
+            return schema_collection.find_one({"host": host, "database": database})
+        except Exception as e:
+            print(f"Error retrieving postgres schema from MongoDB: {e}")
+            return None
+
+    def search_relevant_tables(self, host: str, database: str, table_names: List[str]) -> List[Dict[str, Any]]:
+        """Fetch full metadata for specific tables from MongoDB"""
+        try:
+            if self.client is None:
+                self._legacy_connect()
+                
+            if self.client is None:
+                return []
+                
+            source_db = self.client["metadata_store"]
+            table_metadata_coll = source_db["table_metadata"]
+            
+            cursor = table_metadata_coll.find({
+                "host": host,
+                "database": database,
+                "table": {"$in": table_names}
+            })
+            
+            return list(cursor)
+        except Exception as e:
+            print(f"Error searching table metadata in MongoDB: {e}")
+            return []
+    def query_table_metadata(self, host: str, database: str, filter_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Search table metadata using a raw filter JSON"""
+        try:
+            if self.client is None:
+                self._legacy_connect()
+            
+            if self.client is None:
+                return []
+                
+            source_db = self.client["metadata_store"]
+            table_metadata_coll = source_db["table_metadata"]
+            
+            # Base filter scoped to current DB
+            base_filter = {"host": host, "database": database}
+            
+            # Merge with LLM-generated filter
+            final_filter = {"$and": [base_filter, filter_json]}
+            
+            cursor = table_metadata_coll.find(final_filter)
+            return list(cursor)
+        except Exception as e:
+            print(f"Error querying table metadata in MongoDB: {e}")
+            return []

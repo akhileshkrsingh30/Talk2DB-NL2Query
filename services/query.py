@@ -7,6 +7,7 @@ from services.llm import LLMService
 from services.billing.billing_service import BillingService
 from utils.parsing import extract_sql_queries
 import tiktoken
+import json
 
 class QueryService:
     def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None):
@@ -39,7 +40,7 @@ class QueryService:
             raise ValueError(error_msg)
         
     def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0, user_id: str = None, session_id: str = None) -> Dict[str, Any]:
-        """Process natural language query and return results"""
+        """Process natural language query and return results (Enhanced 2-step approach)"""
         start_time = time.time()
         
         try:
@@ -48,42 +49,86 @@ class QueryService:
             
             print(f"Processing query: {user_query[:100]}...")
             
-            # Get database and LLM instances
-            db = self.db_service.get_langchain_db()
-            llm = self.llm_service.get_llm()
+            # 1. FETCH RELEVANT TABLES FROM MONGODB (LLM CALL 1)
+            db_params = self.db_service.get_connection_params()
+            host = db_params.get("host", "unknown")
+            db_name = db_params.get("database", "unknown")
             
-            print("✓ Got database and LLM instances")
+            print(f"[STEP 1] Searching metadata in MongoDB for DB: '{db_name}' on Host: '{host}'...")
             
-            # Get simplified schema info (avoids SQL DDL to reduce WAF triggers)
-            table_info = self.db_service.get_simplified_schema()
-            print(f"✓ Got simplified schema: {len(table_info)} characters")
+            # Generate MongoDB search filter using LLM
+            search_chain = self.llm_service.create_table_search_mongodb_chain()
             
-            # Generate SQL query
-            sql_chain = self.llm_service.create_sql_chain(db)
-            print("✓ Created SQL chain")
+            # Input tokens for Step 1
+            input_tokens = self.count_tokens(user_query)
             
-            # Prepare input data for SQL generation
-            sql_input = {
-                "Question": user_query,
-                "schema_info": table_info,
-                "table_info": table_info
-            }
+            try:
+                mongo_filter_text = search_chain.invoke({"Question": user_query})
+                output_tokens = self.count_tokens(str(mongo_filter_text))
+            except Exception as llm_err:
+                print(f"[ERROR] LLM Table Search failed: {llm_err}")
+                raise RuntimeError(f"Step 1 Table Search failed: {llm_err}")
             
-            # Count input tokens for SQL generation (approximate by counting variables)
-            # For more accuracy, we would count the full formatted prompt
-            input_tokens = self.count_tokens(user_query) + self.count_tokens(table_info) * 2
+            schema_context = ""
+            try:
+                # Parse the generated filter
+                clean_filter = mongo_filter_text.strip()
+                if clean_filter.startswith("```"):
+                   if "json" in clean_filter:
+                       clean_filter = clean_filter.split("json", 1)[1].rsplit("```", 1)[0].strip()
+                   else:
+                       clean_filter = clean_filter.split("```", 1)[1].rsplit("```", 1)[0].strip()
+                
+                filter_json = json.loads(clean_filter)
+                print(f"[STEP 1] LLM generated filter: {filter_json}")
+                
+                # Search MongoDB for table metadata
+                if self.mongodb_service:
+                    relevant_table_docs = self.mongodb_service.query_table_metadata(host, db_name, filter_json)
+                    print(f"[STEP 1] Found {len(relevant_table_docs)} relevant tables for '{db_name}' in MongoDB.")
+                    
+                    if not relevant_table_docs:
+                        print(f"[WARN] No relevant tables found for '{db_name}'. Using simplified schema fallback.")
+                        schema_context = self.db_service.get_simplified_schema()
+                    else:
+                        # Format found tables into context
+                        schema_context = f"Relevant Tables for database '{db_name}':\n"
+                        for doc in relevant_table_docs[:15]:
+                            cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in doc.get("columns", [])])
+                            schema_context += f"- Table: {doc['table']} (Columns: {cols_desc})\n"
+                else:
+                    print("[WARN] MongoDB service not available. Falling back to full schema.")
+                    schema_context = self.db_service.get_simplified_schema()
             
-            generated_text = sql_chain.invoke(sql_input)
-            print(f"✓ Generated text: {generated_text[:200]}...")
+            except Exception as mongo_err:
+                print(f"[ERROR] MongoDB metadata query failed: {mongo_err}. Falling back.")
+                schema_context = self.db_service.get_simplified_schema()
+
+            # 2. GENERATE SQL (LLM CALL 2)
+            print(f"[STEP 2] Generating PostgreSQL SQL for DB: '{db_name}'...")
+            sql_gen_chain = self.llm_service.create_sql_generation_chain()
+            
+            # Update tokens for Step 2
+            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+            
+            try:
+                generated_text = sql_gen_chain.invoke({
+                    "Question": user_query,
+                    "schema_context": schema_context
+                })
+                print(f"[STEP 2] Successfully generated SQL for '{db_name}'.")
+            except Exception as sql_err:
+                print(f"[ERROR] SQL generation failed for '{db_name}': {sql_err}")
+                raise RuntimeError(f"Step 2 SQL generation failed: {sql_err}")
             
             # Count output tokens for SQL generation
-            output_tokens = self.count_tokens(str(generated_text))
+            output_tokens += self.count_tokens(str(generated_text))
             
             # Extract SQL queries
             sql_queries = extract_sql_queries(str(generated_text))
             
             if not sql_queries:
-                raise ValueError(f"No SQL queries generated from the LLM response: {generated_text}")
+                raise ValueError(f"No SQL queries generated for '{db_name}' from the LLM response.")
             
             print(f"✓ Extracted {len(sql_queries)} SQL queries")
             
@@ -114,12 +159,12 @@ class QueryService:
             # Prepare input data for explanation
             explanation_input = {
                 "Question": user_query,
-                "schema_info": table_info,
+                "schema_info": schema_context,
                 "results": str(results)
             }
             
             # Add to input tokens for explanation
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(table_info)
+            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
             
             explanation = explanation_chain.invoke(explanation_input)
             

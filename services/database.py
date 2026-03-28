@@ -311,3 +311,70 @@ class DatabaseService:
         except Exception:
             pass
         return text
+
+    def get_schema_dict(self) -> Dict[str, Any]:
+        """Fetch database schema as a structured dictionary"""
+        if not self.connected:
+            raise RuntimeError("Database not connected")
+        
+        try:
+            with self.create_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Get tables and columns
+                    cursor.execute(
+                        """
+                        SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
+                        FROM information_schema.columns
+                        WHERE table_schema NOT IN ('pg_catalog','information_schema')
+                        ORDER BY table_schema, table_name, ordinal_position
+                        """
+                    )
+                    cols = cursor.fetchall()
+                    
+                    # Get primary keys
+                    cursor.execute(
+                        """
+                        SELECT kcu.table_schema, kcu.table_name, kcu.column_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                         AND tc.table_name = kcu.table_name
+                        WHERE tc.constraint_type = 'PRIMARY KEY'
+                          AND tc.table_schema NOT IN ('pg_catalog','information_schema')
+                        """
+                    )
+                    pk_rows = cursor.fetchall()
+                    
+            pk_set = set()
+            for r in pk_rows:
+                pk_set.add((r["table_schema"], r["table_name"], r["column_name"]))
+                
+            schema_dict = {}
+            for r in cols:
+                schema_name = r["table_schema"]
+                table_name = r["table_name"]
+                
+                if schema_name not in schema_dict:
+                    schema_dict[schema_name] = {}
+                
+                if table_name not in schema_dict[schema_name]:
+                    schema_dict[schema_name][table_name] = []
+                    
+                column_info = {
+                    "name": r["column_name"],
+                    "type": r["data_type"],
+                    "nullable": r["is_nullable"] == "YES",
+                    "is_primary_key": (schema_name, table_name, r["column_name"]) in pk_set
+                }
+                schema_dict[schema_name][table_name].append(column_info)
+                
+            return {
+                "database": self.connection_params["database"],
+                "host": self.connection_params["host"],
+                "timestamp": datetime.now().isoformat(),
+                "schemas": schema_dict
+            }
+        except Exception as e:
+            print(f"Failed to generate schema dict: {e}")
+            return {"error": str(e), "database": self.connection_params.get("database")}
