@@ -11,6 +11,7 @@ from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
 from services.mongodb import MongoDBService
+from services.neo4j_service import Neo4jService
 from config import settings
 import os
 
@@ -103,6 +104,16 @@ def get_mongodb_service() -> MongoDBService:
     """Dependency to get MongoDB service instance"""
     try:
         return service_registry.get_mongodb_service()
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+def get_neo4j_service() -> Neo4jService:
+    """Dependency to get Neo4j service instance"""
+    try:
+        return service_registry.get_neo4j_service()
     except RuntimeError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

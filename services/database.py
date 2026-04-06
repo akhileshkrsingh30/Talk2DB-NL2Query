@@ -53,64 +53,90 @@ def convert_realdict_to_dict(rows: List[Any]) -> List[Dict[str, Any]]:
     
     return result
 
+try:
+    import mysql.connector
+except ImportError:
+    mysql = None
+
 class DatabaseService:
     def __init__(self):
         self.connection_params: Optional[Dict[str, Any]] = None
         self.connected = False
         self.db_version = None
+        self.db_type = "postgresql" # Default
         self._schema_cache: Dict[str, Dict[str, Any]] = {}
         self._schema_cache_ttl_seconds = 300
         
     def connect(self, connection_params: Dict[str, Any]) -> bool:
         """Establish database connection"""
         try:
-            # Validate required parameters (database is optional)
+            self.db_type = connection_params.get("db_type", settings.db_type).lower()
+            
+            # Validate required parameters (database is optional for Postgres but needed for MySQL sometimes)
             required_fields = ["host", "port", "user", "password"]
             missing_fields = []
             
             for field in required_fields:
                 value = connection_params.get(field)
-                # Check if field is missing, None, or empty string
                 if value is None or (isinstance(value, str) and not value.strip()):
                     missing_fields.append(field)
             
             if missing_fields:
                 raise ValueError(f"Required connection fields missing or empty: {', '.join(missing_fields)}")
                 
-            # Validate port is numeric
-            port_value = str(connection_params["port"]).strip()
-            if not port_value.isdigit():
-                raise ValueError(f"Port must be a number, got: {port_value}")
+            db_name = connection_params.get("database") or ""
+            
+            if self.db_type in ["mysql", "mariadb"]:
+                if mysql is None:
+                    raise ImportError("mysql-connector-python is not installed. Required for MySQL/MariaDB support.")
                 
-            # Default to 'postgres' if no database name provided (database is optional)
-            db_name = connection_params.get("database")
-            if not db_name or (isinstance(db_name, str) and not db_name.strip()):
-                db_name = "postgres"
-                print(f"No database specified, defaulting to 'postgres'")
-                
-            # Test connection
-            with psycopg2.connect(
-                host=connection_params["host"],
-                port=int(connection_params["port"]),
-                database=db_name,
-                user=connection_params["user"],
-                password=connection_params["password"],
-                connect_timeout=5,
-            ) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT version()")
-                    self.db_version = cur.fetchone()[0]
+                # Test connection for MySQL/MariaDB
+                conn_config = {
+                    "host": connection_params["host"],
+                    "port": int(connection_params["port"]),
+                    "user": connection_params["user"],
+                    "password": connection_params["password"],
+                    "database": db_name,
+                    "connect_timeout": 5
+                }
+                # Remove empty database name if present for initial connection
+                if not db_name:
+                    del conn_config["database"]
+                    
+                with mysql.connector.connect(**conn_config) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT VERSION()")
+                    self.db_version = cursor.fetchone()[0]
+                    cursor.close()
+            else:
+                # Default to PostgreSQL
+                if not db_name:
+                    db_name = "postgres"
+                    
+                with psycopg2.connect(
+                    host=connection_params["host"],
+                    port=int(connection_params["port"]),
+                    database=db_name,
+                    user=connection_params["user"],
+                    password=connection_params["password"],
+                    connect_timeout=5,
+                ) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT version()")
+                        self.db_version = cur.fetchone()[0]
             
             # Store connection parameters if successful
             final_params = connection_params.copy()
-            final_params["database"] = db_name
+            if db_name:
+                final_params["database"] = db_name
             self.connection_params = final_params
             self.connected = True
             return True
             
-        except psycopg2.OperationalError as e:
-            raise ConnectionError(f"Database connection failed: {str(e)}")
         except Exception as e:
+            self.connected = False
+            if "psycopg2" in str(e) or "mysql" in str(e):
+                raise ConnectionError(f"Database connection failed: {str(e)}")
             raise RuntimeError(f"Connection error: {str(e)}")
     
     def disconnect(self):
@@ -139,9 +165,17 @@ class DatabaseService:
             
         try:
             with self.create_connection() as conn:
-                with conn.cursor() as cursor:
+                cursor = conn.cursor()
+                if self.db_type in ["mysql", "mariadb"]:
+                    cursor.execute("SHOW DATABASES")
+                else:
                     cursor.execute("SELECT datname FROM pg_database WHERE datistemplate = false;")
-                    rows = cursor.fetchall()
+                
+                rows = cursor.fetchall()
+                # Handle both tuple and dictionary results
+                if self.db_type in ["mysql", "mariadb"]:
+                    return [row[0] if isinstance(row, tuple) else row['Database'] for row in rows]
+                else:
                     return [row['datname'] if isinstance(row, dict) else row[0] for row in rows]
         except Exception as e:
             raise RuntimeError(f"Failed to list databases: {str(e)}")
@@ -157,17 +191,30 @@ class DatabaseService:
         
         # Attempt to connect to the new database
         try:
-            with psycopg2.connect(
-                host=new_params["host"],
-                port=int(new_params["port"]),
-                database=new_params["database"],
-                user=new_params["user"],
-                password=new_params["password"],
-                connect_timeout=5,
-            ) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT version()")
-                    self.db_version = cur.fetchone()[0]
+            if self.db_type in ["mysql", "mariadb"]:
+                with mysql.connector.connect(
+                    host=new_params["host"],
+                    port=int(new_params["port"]),
+                    database=new_params["database"],
+                    user=new_params["user"],
+                    password=new_params["password"],
+                    connect_timeout=5,
+                ) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT VERSION()")
+                    self.db_version = cursor.fetchone()[0]
+            else:
+                with psycopg2.connect(
+                    host=new_params["host"],
+                    port=int(new_params["port"]),
+                    database=new_params["database"],
+                    user=new_params["user"],
+                    password=new_params["password"],
+                    connect_timeout=5,
+                ) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT version()")
+                        self.db_version = cur.fetchone()[0]
             
             # Update connection params and state
             self.connection_params = new_params
@@ -177,19 +224,30 @@ class DatabaseService:
         except Exception as e:
             raise RuntimeError(f"Failed to switch to database '{db_name}': {str(e)}")
 
-    def create_connection(self) -> psycopg2.extensions.connection:
+    def create_connection(self) -> Any:
         """Create a new database connection"""
         if not self.connected:
             raise RuntimeError("Database not connected")
             
-        return psycopg2.connect(
-            host=self.connection_params["host"],
-            port=int(self.connection_params["port"]),
-            database=self.connection_params["database"],
-            user=self.connection_params["user"],
-            password=self.connection_params["password"],
-            cursor_factory=RealDictCursor
-        )
+        if self.db_type in ["mysql", "mariadb"]:
+            # Use dictionary=True to mimic RealDictCursor behavior
+            return mysql.connector.connect(
+                host=self.connection_params["host"],
+                port=int(self.connection_params["port"]),
+                database=self.connection_params["database"],
+                user=self.connection_params["user"],
+                password=self.connection_params["password"],
+                dictionary=True
+            )
+        else:
+            return psycopg2.connect(
+                host=self.connection_params["host"],
+                port=int(self.connection_params["port"]),
+                database=self.connection_params["database"],
+                user=self.connection_params["user"],
+                password=self.connection_params["password"],
+                cursor_factory=RealDictCursor
+            )
     
     def get_langchain_db(self) -> SQLDatabase:
         """Get LangChain SQLDatabase instance"""
@@ -202,7 +260,11 @@ class DatabaseService:
         port = self.connection_params["port"]
         dbname = self.connection_params["database"]
         
-        db_uri = f"postgresql://{username}:{password}@{host}:{port}/{dbname}"
+        if self.db_type in ["mysql", "mariadb"]:
+            db_uri = f"mysql+mysqlconnector://{username}:{password}@{host}:{port}/{dbname}"
+        else:
+            db_uri = f"postgresql://{username}:{password}@{host}:{port}/{dbname}"
+            
         return SQLDatabase.from_uri(db_uri)
     
     def execute_query(self, sql_query: str) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
@@ -220,7 +282,8 @@ class DatabaseService:
                         # Convert RealDictRow objects to regular dictionaries
                         return convert_realdict_to_dict(results)
                     else:
-                        conn.commit()
+                        if self.db_type not in ["mysql", "mariadb"]: # MySQL autocommits usually or handles via connection
+                            conn.commit()
                         return {
                             "status": "Command executed successfully", 
                             "rows_affected": cursor.rowcount,
@@ -246,7 +309,28 @@ class DatabaseService:
             pass
         try:
             with self.create_connection() as conn:
-                with conn.cursor() as cursor:
+                cursor = conn.cursor()
+                if self.db_type in ["mysql", "mariadb"]:
+                    cursor.execute(
+                        """
+                        SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
+                        FROM information_schema.columns
+                        WHERE table_schema = %s
+                        ORDER BY table_name, ordinal_position
+                        """, (self.connection_params["database"],)
+                    )
+                    cols = cursor.fetchall()
+                    
+                    cursor.execute(
+                        """
+                        SELECT table_schema, table_name, column_name
+                        FROM information_schema.key_column_usage
+                        WHERE constraint_name = 'PRIMARY'
+                          AND table_schema = %s
+                        """, (self.connection_params["database"],)
+                    )
+                    pk_rows = cursor.fetchall()
+                else:
                     cursor.execute(
                         """
                         SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
@@ -269,7 +353,8 @@ class DatabaseService:
                         """
                     )
                     pk_rows = cursor.fetchall()
-        except psycopg2.Error as e:
+                cursor.close()
+        except Exception as e:
             raise RuntimeError(f"Schema fetch failed: {str(e)}")
         pk_set = set()
         for r in pk_rows:
@@ -313,14 +398,49 @@ class DatabaseService:
         return text
 
     def get_schema_dict(self) -> Dict[str, Any]:
-        """Fetch database schema as a structured dictionary"""
+        """Fetch database schema as a structured dictionary including foreign keys"""
         if not self.connected:
             raise RuntimeError("Database not connected")
         
         try:
             with self.create_connection() as conn:
-                with conn.cursor() as cursor:
-                    # Get tables and columns
+                cursor = conn.cursor()
+                if self.db_type in ["mysql", "mariadb"]:
+                    # Get tables and columns for MariaDB
+                    cursor.execute(
+                        """
+                        SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
+                        FROM information_schema.columns
+                        WHERE table_schema = %s
+                        ORDER BY table_name, ordinal_position
+                        """, (self.connection_params["database"],)
+                    )
+                    cols = cursor.fetchall()
+                    
+                    # Get primary keys
+                    cursor.execute(
+                        """
+                        SELECT table_schema, table_name, column_name
+                        FROM information_schema.key_column_usage
+                        WHERE constraint_name = 'PRIMARY'
+                          AND table_schema = %s
+                        """, (self.connection_params["database"],)
+                    )
+                    pk_rows = cursor.fetchall()
+
+                    # Get foreign keys
+                    cursor.execute(
+                        """
+                        SELECT table_name, column_name, referenced_table_name as referred_table, 
+                               referenced_table_schema as referred_schema
+                        FROM information_schema.key_column_usage
+                        WHERE referenced_table_name IS NOT NULL
+                          AND table_schema = %s
+                        """, (self.connection_params["database"],)
+                    )
+                    fk_rows = cursor.fetchall()
+                else:
+                    # Get tables and columns for PostgreSQL
                     cursor.execute(
                         """
                         SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
@@ -345,36 +465,71 @@ class DatabaseService:
                         """
                     )
                     pk_rows = cursor.fetchall()
-                    
+
+                    # Get foreign keys
+                    cursor.execute(
+                        """
+                        SELECT kcu.table_name, kcu.column_name, 
+                               ccu.table_name AS referred_table,
+                               ccu.table_schema AS referred_schema
+                        FROM information_schema.table_constraints AS tc 
+                        JOIN information_schema.key_column_usage AS kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                        JOIN information_schema.constraint_column_usage AS ccu
+                          ON ccu.constraint_name = tc.constraint_name
+                        WHERE tc.constraint_type = 'FOREIGN KEY'
+                          AND tc.table_schema NOT IN ('pg_catalog','information_schema');
+                        """
+                    )
+                    fk_rows = cursor.fetchall()
+                cursor.close()
+                
             pk_set = set()
             for r in pk_rows:
-                pk_set.add((r["table_schema"], r["table_name"], r["column_name"]))
+                pk_set.add((r["table_schema"] if "table_schema" in r else self.connection_params["database"], 
+                           r["table_name"], r["column_name"]))
                 
-            schema_dict = {}
+            # Organize columns by table
+            tables_data = {}
             for r in cols:
                 schema_name = r["table_schema"]
                 table_name = r["table_name"]
+                key = (schema_name, table_name)
                 
-                if schema_name not in schema_dict:
-                    schema_dict[schema_name] = {}
+                if key not in tables_data:
+                    tables_data[key] = {
+                        "name": table_name,
+                        "schema": schema_name,
+                        "columns": [],
+                        "foreign_keys": []
+                    }
                 
-                if table_name not in schema_dict[schema_name]:
-                    schema_dict[schema_name][table_name] = []
-                    
                 column_info = {
                     "name": r["column_name"],
                     "type": r["data_type"],
                     "nullable": r["is_nullable"] == "YES",
                     "is_primary_key": (schema_name, table_name, r["column_name"]) in pk_set
                 }
-                schema_dict[schema_name][table_name].append(column_info)
+                tables_data[key]["columns"].append(column_info)
+
+            # Add foreign keys
+            for r in fk_rows:
+                schema_name = r.get("table_schema") or self.connection_params["database"]
+                table_name = r["table_name"]
+                key = (schema_name, table_name)
+                
+                if key in tables_data:
+                    tables_data[key]["foreign_keys"].append({
+                        "column": r["column_name"],
+                        "referred_table": r["referred_table"],
+                        "referred_schema": r.get("referred_schema") or schema_name
+                    })
                 
             return {
                 "database": self.connection_params["database"],
-                "host": self.connection_params["host"],
-                "timestamp": datetime.now().isoformat(),
-                "schemas": schema_dict
+                "tables": list(tables_data.values())
             }
         except Exception as e:
             print(f"Failed to generate schema dict: {e}")
-            return {"error": str(e), "database": self.connection_params.get("database")}
+            return {"error": str(e), "database": self.connection_params.get("database"), "tables": []}

@@ -16,3 +16,5 @@ pytest>=7.4.3
 requests>=2.31.0
 tiktoken>=0.5.2
 pymongo>=4.6.1
+neo4j>=5.14.1
+mysql-connector-python>=8.0.33

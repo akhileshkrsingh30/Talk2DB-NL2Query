@@ -11,7 +11,8 @@ from schemas import DatabaseConnection, DatabaseSelect, ConnectionResponse, Data
 from services.database import DatabaseService, convert_realdict_to_dict
 from services.llm import LLMService
 from services.mongodb import MongoDBService
-from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service
+from services.neo4j_service import Neo4jService
+from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service, get_neo4j_service
 
 router = APIRouter(prefix="/database", tags=["database"])
 
@@ -27,6 +28,7 @@ async def connect_to_database(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
+    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Connect to a PostgreSQL database"""
@@ -40,7 +42,8 @@ async def connect_to_database(
             "port": connection.port,
             "database": connection.database,
             "user": connection.user,
-            "password": connection.password
+            "password": connection.password,
+            "db_type": connection.db_type or settings.db_type
         }
         
         success = db_service.connect(connection_params)
@@ -66,6 +69,22 @@ async def connect_to_database(
                 mongodb_service.push_postgres_schema(schema_dict)
             except Exception as e:
                 print(f"Failed to auto-push schema to MongoDB: {e}")
+
+            # NEW: Push schema to Neo4j if not already present
+            try:
+                db_name = connection.database or "postgres"
+                if neo4j_service.is_connected():
+                    if not neo4j_service.schema_exists(db_name):
+                        print(f"Schema for {db_name} not found in Neo4j. Pushing now...")
+                        schema_dict = db_service.get_schema_dict()
+                        neo4j_service.push_schema(db_name, schema_dict)
+                        print(f"Successfully pushed schema for {db_name} to Neo4j")
+                    else:
+                        print(f"Schema for {db_name} already exists in Neo4j. Skipping push.")
+                else:
+                    print("Neo4j not connected. Skipping schema sync.")
+            except Exception as e:
+                print(f"Failed to sync schema to Neo4j: {e}")
 
             return ConnectionResponse(
                 status="success",
@@ -156,6 +175,7 @@ async def select_database(
     selection: DatabaseSelect,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
+    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Switch to a specific database after listing them"""
@@ -168,6 +188,22 @@ async def select_database(
                 mongodb_service.push_postgres_schema(schema_dict)
             except Exception as e:
                 print(f"Failed to auto-push schema to MongoDB: {e}")
+
+            # NEW: Push schema to Neo4j if not already present
+            try:
+                db_name = selection.database
+                if neo4j_service.is_connected():
+                    if not neo4j_service.schema_exists(db_name):
+                        print(f"Schema for {db_name} not found in Neo4j. Pushing now...")
+                        schema_dict = db_service.get_schema_dict()
+                        neo4j_service.push_schema(db_name, schema_dict)
+                        print(f"Successfully pushed schema for {db_name} to Neo4j")
+                    else:
+                        print(f"Schema for {db_name} already exists in Neo4j. Skipping push.")
+                else:
+                    print("Neo4j not connected. Skipping schema sync.")
+            except Exception as e:
+                print(f"Failed to sync schema to Neo4j: {e}")
 
             params = db_service.get_connection_params()
             return ConnectionResponse(

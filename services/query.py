@@ -5,16 +5,18 @@ from datetime import datetime
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.billing.billing_service import BillingService
+from services.neo4j_service import Neo4jService
 from utils.parsing import extract_sql_queries
 import tiktoken
 import json
 
 class QueryService:
-    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None):
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None, neo4j_service = None):
         self.db_service = db_service
         self.llm_service = llm_service
         self.billing_service = billing_service
         self.mongodb_service = mongodb_service
+        self.neo4j_service = neo4j_service
         self.query_history = []
         try:
             self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -39,7 +41,8 @@ class QueryService:
                 error_msg += f" Current config state: {config_details}"
             raise ValueError(error_msg)
         
-    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0, user_id: str = None, session_id: str = None) -> Dict[str, Any]:
+    def process_query(self, user_query: str, max_tokens: int = 1024, temperature: float = 0.0, 
+                      user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None) -> Dict[str, Any]:
         """Process natural language query and return results (Enhanced 2-step approach)"""
         start_time = time.time()
         
@@ -49,60 +52,77 @@ class QueryService:
             
             print(f"Processing query: {user_query[:100]}...")
             
-            # 1. FETCH RELEVANT TABLES FROM MONGODB (LLM CALL 1)
+            # 1. FETCH RELEVANT TABLES FROM NEO4J (LLM CALL 1)
             db_params = self.db_service.get_connection_params()
             host = db_params.get("host", "unknown")
             db_name = db_params.get("database", "unknown")
             
-            print(f"[STEP 1] Searching metadata in MongoDB for DB: '{db_name}' on Host: '{host}'...")
+            print(f"[STEP 1] Using Neo4j graph for schema discovery in DB: '{db_name}'...")
             
-            # Generate MongoDB search filter using LLM
-            search_chain = self.llm_service.create_table_search_mongodb_chain()
-            
-            # Input tokens for Step 1
+            # Token tracking
             input_tokens = self.count_tokens(user_query)
-            
-            try:
-                mongo_filter_text = search_chain.invoke({"Question": user_query})
-                output_tokens = self.count_tokens(str(mongo_filter_text))
-            except Exception as llm_err:
-                print(f"[ERROR] LLM Table Search failed: {llm_err}")
-                raise RuntimeError(f"Step 1 Table Search failed: {llm_err}")
+            output_tokens = 0
             
             schema_context = ""
             try:
-                # Parse the generated filter
-                clean_filter = mongo_filter_text.strip()
-                if clean_filter.startswith("```"):
-                   if "json" in clean_filter:
-                       clean_filter = clean_filter.split("json", 1)[1].rsplit("```", 1)[0].strip()
-                   else:
-                       clean_filter = clean_filter.split("```", 1)[1].rsplit("```", 1)[0].strip()
-                
-                filter_json = json.loads(clean_filter)
-                print(f"[STEP 1] LLM generated filter: {filter_json}")
-                
-                # Search MongoDB for table metadata
-                if self.mongodb_service:
-                    relevant_table_docs = self.mongodb_service.query_table_metadata(host, db_name, filter_json)
-                    print(f"[STEP 1] Found {len(relevant_table_docs)} relevant tables for '{db_name}' in MongoDB.")
+                # Use Neo4j if available, otherwise fallback to MongoDB or full schema
+                if self.neo4j_service and self.neo4j_service.is_connected():
+                    print("[STEP 1] Extracting keywords for Neo4j search...")
+                    keyword_chain = self.llm_service.create_keyword_extraction_chain()
+                    keywords_text = keyword_chain.invoke({"Question": user_query})
+                    output_tokens += self.count_tokens(str(keywords_text))
                     
-                    if not relevant_table_docs:
-                        print(f"[WARN] No relevant tables found for '{db_name}'. Using simplified schema fallback.")
-                        schema_context = self.db_service.get_simplified_schema()
+                    keywords = [k.strip() for k in keywords_text.split(",") if k.strip()]
+                    print(f"[STEP 1] Extracted keywords: {keywords}")
+                    
+                    relevant_nodes = self.neo4j_service.find_relevant_schema(db_name, keywords)
+                    # Limit to 15 relevant tables to prevent overly large context
+                    relevant_nodes = relevant_nodes[:15]
+                    print(f"[STEP 1] Found {len(relevant_nodes)} relevant tables in Neo4j.")
+                    
+                    if relevant_nodes:
+                        schema_context = f"Relevant Tables for database '{db_name}' (discovered via Neo4j graph):\n"
+                        for node in relevant_nodes:
+                            cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in node.get("columns", [])])
+                            schema_context += f"- Table: {node['table_name']} (Columns: {cols_desc})\n"
                     else:
-                        # Format found tables into context
-                        schema_context = f"Relevant Tables for database '{db_name}':\n"
+                        print("[STEP 1] No relevant nodes found in Neo4j. Checking MongoDB fallback...")
+                
+                # Fallback to MongoDB if Neo4j failed or returned nothing
+                if not schema_context and self.mongodb_service:
+                    print(f"[STEP 1] Falling back to MongoDB for DB: '{db_name}'...")
+                    search_chain = self.llm_service.create_table_search_mongodb_chain()
+                    mongo_filter_text = search_chain.invoke({"Question": user_query})
+                    
+                    clean_filter = mongo_filter_text.strip()
+                    if clean_filter.startswith("```"):
+                       if "json" in clean_filter:
+                           clean_filter = clean_filter.split("json", 1)[1].rsplit("```", 1)[0].strip()
+                       else:
+                           clean_filter = clean_filter.split("```", 1)[1].rsplit("```", 1)[0].strip()
+                    
+                    filter_json = json.loads(clean_filter)
+                    relevant_table_docs = self.mongodb_service.query_table_metadata(host, db_name, filter_json)
+                    
+                    if relevant_table_docs:
+                        schema_context = f"Relevant Tables for database '{db_name}' (discovered via MongoDB):\n"
                         for doc in relevant_table_docs[:15]:
                             cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in doc.get("columns", [])])
                             schema_context += f"- Table: {doc['table']} (Columns: {cols_desc})\n"
-                else:
-                    print("[WARN] MongoDB service not available. Falling back to full schema.")
+
+                # Final fallback to simplified full schema
+                if not schema_context:
+                    print("[STEP 1] No discovery possible. Using full simplified schema.")
                     schema_context = self.db_service.get_simplified_schema()
             
-            except Exception as mongo_err:
-                print(f"[ERROR] MongoDB metadata query failed: {mongo_err}. Falling back.")
+            except Exception as discovery_err:
+                print(f"[ERROR] Schema discovery failed: {discovery_err}. Falling back to full schema.")
                 schema_context = self.db_service.get_simplified_schema()
+            
+            # Final safety truncation (max approx 8000 tokens)
+            if len(schema_context) > 24000:
+                print(f"[STEP 1] Truncating schema context from {len(schema_context)} characters...")
+                schema_context = schema_context[:24000] + "\n[...schema truncated for size...]"
 
             # 2. GENERATE SQL (LLM CALL 2)
             print(f"[STEP 2] Generating PostgreSQL SQL for DB: '{db_name}'...")
@@ -194,7 +214,9 @@ class QueryService:
                 "total_tokens": input_tokens + output_tokens,
                 "billing": billing_info,
                 "user_id": user_id,
-                "session_id": session_id
+                "session_id": session_id,
+                "message_id": message_id,
+                "company_id": company_id
             }
             
             # Store in history

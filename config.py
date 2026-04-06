@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     )
     
     # Database configuration
+    db_type: str = Field("postgresql", env="DB_TYPE")
     db_host: str = Field("", env="DB_HOST")
     db_port: str = Field("5432", env="DB_PORT")
     db_name: str = Field("", env="DB_NAME")
@@ -39,6 +40,11 @@ class Settings(BaseSettings):
     mongo_uri: str = Field("mongodb://localhost:27017/", env="MONGO_URI")
     mongo_db_name: str = Field("ValoDSS", env="MONGO_DB_NAME")
     
+    # Neo4j configuration
+    neo4j_uri: str = Field("bolt://localhost:7687", env="NEO4J_URI")
+    neo4j_user: str = Field("neo4j", env="NEO4J_USER")
+    neo4j_password: str = Field("password", env="NEO4J_PASSWORD")
+    
     # Application settings
     app_title: str = "Database Query API"
     app_version: str = "1.0.0"
@@ -52,6 +58,7 @@ class Settings(BaseSettings):
         
         # Debug: Print loaded environment variables
         print("Environment variables loaded:")
+        print(f"   DB_TYPE: {self.db_type}")
         print(f"   DB_HOST: {self.db_host}")
         print(f"   DB_NAME: {self.db_name}")
         print(f"   DB_USER: {self.db_user}")
@@ -61,6 +68,8 @@ class Settings(BaseSettings):
         print(f"   MODEL_NAME: {self.llm_model_name}")
         print(f"   MONGO_URI: {self.mongo_uri}")
         print(f"   MONGO_DB_NAME: {self.mongo_db_name}")
+        print(f"   NEO4J_URI: {self.neo4j_uri}")
+        print(f"   NEO4J_USER: {self.neo4j_user}")
         
         env_path = os.path.join(os.getcwd(), ".env")
         print(f"   Current Working Directory: {os.getcwd()}")

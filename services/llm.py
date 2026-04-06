@@ -99,7 +99,8 @@ class LLMService:
                 openai_api_key=api_key,
                 model=model,
                 temperature=0.0,
-                model_kwargs={"max_completion_tokens": 1024},
+                max_tokens=1024,
+                timeout=120,
                 default_headers=headers,
             )
             
@@ -205,6 +206,23 @@ class LLMService:
             6. The summary should be easy to read in any plain text application.
             """
         ) | self.llm | StrOutputParser()
+
+    def create_keyword_extraction_chain(self):
+        """Create a chain to extract high-level keywords/entities for schema searching"""
+        prompt = ChatPromptTemplate.from_template(
+            """
+            You are a database expert. Given a natural language question about a database, 
+            extract a list of 3-5 core keywords or entities that are likely to represent table or column names 
+            relevant to the question. Focus on nouns and significant terms.
+            
+            Return ONLY a comma-separated list of keywords, nothing else.
+            
+            Question: {Question}
+            
+            Keywords:
+            """
+        )
+        return prompt | self.llm | StrOutputParser()
 
     def create_table_search_mongodb_chain(self):
         """Step 1: Generate a MongoDB query to find relevant tables from metadata"""
