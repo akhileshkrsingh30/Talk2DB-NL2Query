@@ -17,6 +17,7 @@ from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
 from services.mongodb import MongoDBService
+from services.neo4j_service import Neo4jService
 from services.registry import service_registry
 from schemas import HealthCheck
 from dependencies import verify_token
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI):
     sharing_service = SharingService()
     billing_service = BillingService()
     mongodb_service = MongoDBService()
+    neo4j_service = Neo4jService()
     
     # Register services in the registry
     service_registry.set_db_service(db_service)
@@ -38,6 +40,7 @@ async def lifespan(app: FastAPI):
     service_registry.set_sharing_service(sharing_service)
     service_registry.set_billing_service(billing_service)
     service_registry.set_mongodb_service(mongodb_service)
+    service_registry.set_neo4j_service(neo4j_service)
     
     # Try to connect to database from environment variables
     if all([settings.db_host, settings.db_port, settings.db_name, settings.db_user]):
@@ -48,11 +51,39 @@ async def lifespan(app: FastAPI):
                 "port": settings.db_port,
                 "database": settings.db_name,
                 "user": settings.db_user,
-                "password": settings.db_password
+                "password": settings.db_password,
+                "db_type": settings.db_type
             })
             print("Database connected successfully")
+
+            # Sync schema to Neo4j if possible
+            try:
+                if neo4j_service.is_connected():
+                    db_name = settings.db_name or "postgres"
+                    if not neo4j_service.schema_exists(db_name):
+                        print(f"Schema for {db_name} not found in Neo4j. Pushing now...")
+                        schema_dict = db_service.get_schema_dict()
+                        neo4j_service.push_schema(db_name, schema_dict)
+                        print(f"Successfully pushed schema for {db_name} to Neo4j")
+                else:
+                    print("Neo4j not connected. Skipping schema sync.")
+            except Exception as e:
+                print(f"Failed to sync schema to Neo4j during auto-connect: {e}")
         except Exception as e:
             print(f"Database auto-connection failed: {e}")
+
+    # Try to connect to Neo4j
+    if all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):
+        try:
+            print(f"Connecting to Neo4j at {settings.neo4j_uri}...")
+            neo4j_service.connect(
+                settings.neo4j_uri,
+                settings.neo4j_user,
+                settings.neo4j_password
+            )
+            print("Neo4j connected successfully")
+        except Exception as e:
+            print(f"Neo4j auto-connection failed: {e}")
 
     # Try to configure LLM from environment variables
     # Use Krutim if key is provided, otherwise fallback to OpenAI
@@ -142,6 +173,7 @@ async def get_configuration():
     try:
         db_service = service_registry.get_db_service()
         llm_service = service_registry.get_llm_service()
+        neo4j_service = service_registry.get_neo4j_service()
         
         return {
             "db_host": settings.db_host,
@@ -151,7 +183,8 @@ async def get_configuration():
             "openai_api_base": settings.openai_api_base,
             "model_name": settings.llm_model_name,
             "db_connected": db_service.is_connected(),
-            "llm_configured": llm_service.is_configured()
+            "llm_configured": llm_service.is_configured(),
+            "neo4j_connected": neo4j_service.is_connected()
         }
     except Exception:
         return {

@@ -10,12 +10,14 @@ from services.llm import LLMService
 from services.query import QueryService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
+from services.neo4j_service import Neo4jService
 from dependencies import (
     get_db_service, 
     get_llm_service, 
     get_sharing_service, 
     get_billing_service,
     get_mongodb_service,
+    get_neo4j_service,
     verify_token
 )
 
@@ -25,11 +27,12 @@ def get_query_service(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     billing_service: Annotated[BillingService, Depends(get_billing_service)],
-    mongodb_service: Annotated[Any, Depends(get_mongodb_service)]
+    mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
+    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)]
 ) -> QueryService:
     """Get a fresh query service instance with current service states"""
     # Always create a fresh instance to ensure we have the latest service states
-    return QueryService(db_service, llm_service, billing_service, mongodb_service)
+    return QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
 
 @router.post("/process", response_model=QueryResult, responses={400: {"model": ErrorResponse}})
 async def process_natural_language_query(
@@ -44,7 +47,9 @@ async def process_natural_language_query(
             max_tokens=query_request.max_tokens,
             temperature=query_request.temperature,
             user_id=current_user,
-            session_id=query_request.session_id
+            session_id=query_request.session_id,
+            message_id=query_request.message_id,
+            company_id=query_request.company_id
         )
         return result
         
@@ -81,6 +86,7 @@ async def process_natural_language_query_batch(
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     billing_service: Annotated[BillingService, Depends(get_billing_service)],
     mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
+    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     try:
@@ -108,13 +114,15 @@ async def process_natural_language_query_batch(
 
             def run_item(index: int, q):
                 try:
-                    service = QueryService(db_service, llm_service, billing_service, mongodb_service)
+                    service = QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
                     return service.process_query(
                         user_query=q.query, 
                         max_tokens=q.max_tokens, 
                         temperature=q.temperature,
                         user_id=current_user,
-                        session_id=q.session_id
+                        session_id=q.session_id,
+                        message_id=q.message_id,
+                        company_id=q.company_id
                     )
                 except Exception as e:
                     # Return a partial failure result instead of crashing
@@ -129,7 +137,9 @@ async def process_natural_language_query_batch(
                         output_tokens=0,
                         total_tokens=0,
                         user_id=current_user,
-                        session_id=q.session_id
+                        session_id=q.session_id,
+                        message_id=q.message_id,
+                        company_id=q.company_id
                     )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -141,7 +151,7 @@ async def process_natural_language_query_batch(
                     idx = future_map[future]
                     results[idx] = future.result()
         else:
-            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service)
+            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
             results: List[QueryResult] = []
             for item in batch_request.queries:
                 try:
@@ -150,7 +160,9 @@ async def process_natural_language_query_batch(
                         max_tokens=item.max_tokens,
                         temperature=item.temperature,
                         user_id=current_user,
-                        session_id=item.session_id
+                        session_id=item.session_id,
+                        message_id=item.message_id,
+                        company_id=item.company_id
                     )
                     results.append(res)
                 except Exception as e:
@@ -160,7 +172,11 @@ async def process_natural_language_query_batch(
                         results=[],
                         explanation=f"Error processing query: {str(e)}",
                         timestamp=datetime.now(),
-                        execution_time=0.0
+                        execution_time=0.0,
+                        user_id=current_user,
+                        session_id=item.session_id,
+                        message_id=item.message_id,
+                        company_id=item.company_id
                     ))
 
         total_time = time.time() - start_time

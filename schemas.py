@@ -8,6 +8,7 @@ class DatabaseConnection(BaseModel):
     database: Optional[str] = Field(None, description="Database name (optional, defaults to 'postgres' if not provided)")
     user: str = Field(..., description="Database username")
     password: str = Field(..., description="Database password")
+    db_type: Optional[str] = Field("postgresql", description="Database type (postgresql, mysql, mariadb)")
 
 class DatabaseSelect(BaseModel):
     database: str = Field(..., description="Database name to switch to")
@@ -18,18 +19,25 @@ class ConnectionResponse(BaseModel):
     version: Optional[str] = Field(None, description="Database version if connected")
     details: Optional[Dict[str, str]] = Field(None, description="Connection details")
 
+from uuid import uuid4
+
 class QueryRequest(BaseModel):
+    session_id: str = Field(default_factory=lambda: str(uuid4()), description="Unique session identifier")
+    message_id: str = Field(default_factory=lambda: str(uuid4()), description="Unique message identifier")
+    company_id: str = Field(default_factory=lambda: str(uuid4()), description="Unique company identifier")
     query: str = Field(..., description="Natural language query")
     max_tokens: Optional[int] = Field(1024, description="Maximum tokens for LLM response")
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
-    session_id: Optional[str] = Field(None, description="Optional session identifier")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")
     order: int = Field(..., description="Execution order")
 
 class QueryResult(BaseModel):
+    session_id: str = Field(..., description="Unique session identifier")
+    message_id: str = Field(..., description="Unique message identifier")
+    company_id: str = Field(..., description="Unique company identifier")
     query: str = Field(..., description="Original natural language query")
     sql_queries: List[SQLQuery] = Field(..., description="Generated SQL queries")
     results: List[Union[List[Dict[str, Any]], Dict[str, Any]]] = Field(..., description="Query execution results")
@@ -41,7 +49,6 @@ class QueryResult(BaseModel):
     total_tokens: Optional[int] = Field(None, description="Total number of tokens used")
     billing: Optional[Dict[str, Any]] = Field(None, description="Billing and cost information")
     user_id: Optional[str] = Field(None, description="User identifier from request")
-    session_id: Optional[str] = Field(None, description="Session identifier from request")
     
     class Config:
         # Allow any additional fields that might come from the database
