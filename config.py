@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     openai_api_key: str = Field("", env="OPENAI_API_KEY")
     openai_api_base: str = Field("", env="OPENAI_API_BASE")
     llm_model_name: str = Field("gpt-5.2", env="LLM_MODEL_NAME")
+    llm_max_context_chars: int = Field(100000, env="LLM_MAX_CONTEXT_CHARS")
+    llm_max_output_tokens: int = Field(4096, env="LLM_MAX_OUTPUT_TOKENS")
     
     # Billing configuration (Price per 1M tokens in USD)
     price_input_1m: float = Field(0.15, env="BILLING_PRICE_INPUT_1M")
@@ -70,6 +72,8 @@ class Settings(BaseSettings):
         print(f"   MONGO_DB_NAME: {self.mongo_db_name}")
         print(f"   NEO4J_URI: {self.neo4j_uri}")
         print(f"   NEO4J_USER: {self.neo4j_user}")
+        print(f"   MAX_CONTEXT_CHARS: {self.llm_max_context_chars}")
+        print(f"   MAX_OUTPUT_TOKENS: {self.llm_max_output_tokens}")
         
         env_path = os.path.join(os.getcwd(), ".env")
         print(f"   Current Working Directory: {os.getcwd()}")

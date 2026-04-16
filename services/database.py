@@ -7,6 +7,7 @@ import json
 from datetime import datetime, date, time
 from decimal import Decimal
 
+import logging
 from config import settings
 from utils.database import make_db_cache_key
 
@@ -54,9 +55,11 @@ def convert_realdict_to_dict(rows: List[Any]) -> List[Dict[str, Any]]:
     return result
 
 try:
-    import mysql.connector
+    import pymysql as mysql
+    mysql.connector = mysql
 except ImportError:
     mysql = None
+
 
 class DatabaseService:
     def __init__(self):
@@ -103,9 +106,9 @@ class DatabaseService:
                 if not db_name:
                     del conn_config["database"]
                     
-                with mysql.connector.connect(**conn_config) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT VERSION()")
+                with mysql.connect(**conn_config) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT VERSION()")
                     self.db_version = cursor.fetchone()[0]
                     cursor.close()
             else:
@@ -192,7 +195,7 @@ class DatabaseService:
         # Attempt to connect to the new database
         try:
             if self.db_type in ["mysql", "mariadb"]:
-                with mysql.connector.connect(
+                with mysql.connect(
                     host=new_params["host"],
                     port=int(new_params["port"]),
                     database=new_params["database"],
@@ -200,8 +203,8 @@ class DatabaseService:
                     password=new_params["password"],
                     connect_timeout=5,
                 ) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT VERSION()")
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT VERSION()")
                     self.db_version = cursor.fetchone()[0]
             else:
                 with psycopg2.connect(
@@ -231,13 +234,14 @@ class DatabaseService:
             
         if self.db_type in ["mysql", "mariadb"]:
             # Use dictionary=True to mimic RealDictCursor behavior
-            return mysql.connector.connect(
+            # Use DictCursor to mimic RealDictCursor behavior
+            return mysql.connect(
                 host=self.connection_params["host"],
                 port=int(self.connection_params["port"]),
                 database=self.connection_params["database"],
                 user=self.connection_params["user"],
                 password=self.connection_params["password"],
-                dictionary=True
+                cursorclass=mysql.cursors.DictCursor
             )
         else:
             return psycopg2.connect(
@@ -272,6 +276,8 @@ class DatabaseService:
         if not self.connected:
             raise RuntimeError("Database not connected")
             
+        import time
+        start_time = time.time()
         try:
             with self.create_connection() as conn:
                 with conn.cursor() as cursor:
@@ -279,11 +285,16 @@ class DatabaseService:
                     
                     if sql_query.strip().lower().startswith("select"):
                         results = cursor.fetchall()
+                        elapsed = time.time() - start_time
                         # Convert RealDictRow objects to regular dictionaries
-                        return convert_realdict_to_dict(results)
+                        dict_results = convert_realdict_to_dict(results)
+                        logging.info(f"   [OK] DB Response: {len(dict_results)} rows in {elapsed:.3f}s")
+                        return dict_results
                     else:
                         if self.db_type not in ["mysql", "mariadb"]: # MySQL autocommits usually or handles via connection
                             conn.commit()
+                        elapsed = time.time() - start_time
+                        logging.info(f"   [OK] Command executed: {cursor.rowcount} rows affected in {elapsed:.3f}s")
                         return {
                             "status": "Command executed successfully", 
                             "rows_affected": cursor.rowcount,
@@ -407,6 +418,7 @@ class DatabaseService:
                 cursor = conn.cursor()
                 if self.db_type in ["mysql", "mariadb"]:
                     # Get tables and columns for MariaDB
+                    cursor = conn.cursor(cursor=mysql.cursors.DictCursor)
                     cursor.execute(
                         """
                         SELECT table_schema, table_name, column_name, data_type, is_nullable, ordinal_position
@@ -428,7 +440,7 @@ class DatabaseService:
                     )
                     pk_rows = cursor.fetchall()
 
-                    # Get foreign keys
+                    # Get foreign keys (existing)
                     cursor.execute(
                         """
                         SELECT table_name, column_name, referenced_table_name as referred_table, 
@@ -439,6 +451,16 @@ class DatabaseService:
                         """, (self.connection_params["database"],)
                     )
                     fk_rows = cursor.fetchall()
+                    
+                    # NEW: Get estimated row counts for MySQL/MariaDB
+                    cursor.execute(
+                        """
+                        SELECT table_schema, table_name, table_rows as row_count
+                        FROM information_schema.tables
+                        WHERE table_schema = %s
+                        """, (self.connection_params["database"],)
+                    )
+                    count_rows = cursor.fetchall()
                 else:
                     # Get tables and columns for PostgreSQL
                     cursor.execute(
@@ -474,15 +496,27 @@ class DatabaseService:
                                ccu.table_schema AS referred_schema
                         FROM information_schema.table_constraints AS tc 
                         JOIN information_schema.key_column_usage AS kcu
-                          ON tc.constraint_name = kcu.constraint_name
-                         AND tc.table_schema = kcu.table_schema
+                           ON tc.constraint_name = kcu.constraint_name
+                          AND tc.table_schema = kcu.table_schema
                         JOIN information_schema.constraint_column_usage AS ccu
-                          ON ccu.constraint_name = tc.constraint_name
+                           ON ccu.constraint_name = tc.constraint_name
                         WHERE tc.constraint_type = 'FOREIGN KEY'
-                          AND tc.table_schema NOT IN ('pg_catalog','information_schema');
+                           AND tc.table_schema NOT IN ('pg_catalog','information_schema');
                         """
                     )
                     fk_rows = cursor.fetchall()
+
+                    # NEW: Get estimated row counts for PostgreSQL
+                    cursor.execute(
+                        """
+                        SELECT n.nspname AS table_schema, c.relname AS table_name, c.reltuples AS row_count
+                        FROM pg_class c
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE c.relkind = 'r' 
+                          AND n.nspname NOT IN ('pg_catalog','information_schema')
+                        """
+                    )
+                    count_rows = cursor.fetchall()
                 cursor.close()
                 
             pk_set = set()
@@ -512,6 +546,15 @@ class DatabaseService:
                     "is_primary_key": (schema_name, table_name, r["column_name"]) in pk_set
                 }
                 tables_data[key]["columns"].append(column_info)
+
+            # Add row counts
+            counts_map = {}
+            for r in count_rows:
+                schema_name = r.get("table_schema") or self.connection_params["database"]
+                counts_map[(schema_name, r["table_name"])] = int(r["row_count"])
+            
+            for key in tables_data:
+                tables_data[key]["estimated_rows"] = counts_map.get(key, 0)
 
             # Add foreign keys
             for r in fk_rows:

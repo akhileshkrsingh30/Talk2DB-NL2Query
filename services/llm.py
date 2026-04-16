@@ -81,9 +81,20 @@ class LLMService:
             if headers:
                 print(f"   Custom headers: {list(headers.keys())}")
             
-            # Test the API key first (unless bypassed)
-            if validate_key and not self.test_api_key(api_key, base_url, model, headers):
-                raise ValueError(self.last_error or "Invalid API key or connection failed. Please check your credentials and network access.")
+            # Skip live connectivity test for local/Ollama endpoints — they don't validate real API keys
+            # and may not be running at configuration time. Test only for real external APIs.
+            is_local_or_ollama = (
+                "localhost" in base_url
+                or "127.0.0.1" in base_url
+                or "ollama" in api_key.lower()
+                or api_key.lower() in ["ollama", "none", "local"]
+            )
+            
+            if validate_key and not is_local_or_ollama:
+                if not self.test_api_key(api_key, base_url, model, headers):
+                    raise ValueError(self.last_error or "Invalid API key or connection failed. Please check your credentials and network access.")
+            elif is_local_or_ollama:
+                print(f"   [Ollama/Local] Skipping live API key validation for local endpoint.")
             
             # Store configuration details
             self.config_details = {
@@ -93,15 +104,24 @@ class LLMService:
                 "headers": list(headers.keys()) if headers else None
             }
             
+            model_kwargs = {}
+            if "nemotron" in model.lower():
+                model_kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "reasoning_budget": 16384
+                }
+            
             # Create the LLM instance
             self.llm = ChatOpenAI(
                 openai_api_base=base_url,
                 openai_api_key=api_key,
                 model=model,
-                temperature=0.0,
-                max_tokens=1024,
+                temperature=1.0 if "nemotron" in model.lower() else 0.0,
+                max_tokens=16384 if "nemotron" in model.lower() else settings.llm_max_output_tokens,
+                top_p=0.95 if "nemotron" in model.lower() else 1.0,
                 timeout=120,
                 default_headers=headers,
+                model_kwargs=model_kwargs
             )
             
             self.configured = True
@@ -109,6 +129,12 @@ class LLMService:
             return True
             
         except Exception as e:
+            err_str = str(e)
+            # Self-healing: If model not found, try to fallback to default
+            if "404" in err_str and model != settings.llm_model_name:
+                print(f"⚠️ Model '{model}' not found. Attempting fallback to default '{settings.llm_model_name}'...")
+                return self.configure(api_key, base_url, settings.llm_model_name, headers, validate_key)
+                
             self.configured = False
             self.llm = None
             self.config_details = None
@@ -178,8 +204,9 @@ class LLMService:
             - Use ONLY the exact column names provided in the schema above
             - Do NOT use generic column names like "date"; verify the exact column name from the schema
             - Double-check that every referenced column exists in the schema
-            - Use proper PostgreSQL syntax
+            - Use modular CTEs (WITH clauses) for complex logic involving more than 3 tables
             - For date/timestamp columns, verify the exact column name from the schema (e.g., order_date, created_at)
+            - Check join connectivity before generating; do not assume join paths if keys are not visible in the capsules
             - Return only the SQL query, no explanations or markdown
             """
         )
@@ -197,30 +224,73 @@ class LLMService:
             Database Schema: {schema_info}
             Query Results: {results}
 
-            Instructions:
-            1. Provide a direct, professional, and conversational answer to the user's question.
-            2. CRITICAL: Do NOT use any Markdown formatting. No asterisks (**), no hashtags (#), no backticks (`), and no bolding symbols.
-            3. Use standard sentence case and normal punctuation.
-            4. If the data results are empty, state clearly that no records were found.
-            5. Present any lists using simple numbers (1., 2.) or bullet points (- ) that are readable as plain text.
-            6. The summary should be easy to read in any plain text application.
+            CRITICAL GROUNDING RULES:
+            1. ONLY answer based on the provided "Query Results". 
+            2. If the results say "Insufficient schema context", inform the user that the specific data requested was not found.
+            3. NEVER invent numbers (e.g., do not say 'There are 50 tables' if the results don't specifically contain that number).
+            4. If the results are empty, state that no information was found for that specific question.
+            5. Use plain text only. NO Markdown. NO asterisks (**), NO bolding, NO backticks.
             """
         ) | self.llm | StrOutputParser()
+
+    def create_concept_extraction_chain(self):
+        """Create a chain to extract business concepts and roles for graph-based discovery"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured.")
+        prompt = ChatPromptTemplate.from_template(
+            """You are a Database Architect. Analyze the user's question and extract the core business concepts.
+            Question: {Question}
+            Identify:
+            1. ANCHOR ENTITIES: Main business nouns (e.g. Orders, Employees).
+            2. ATTRIBUTES: Needed fields (e.g. status, tax, region).
+            
+            Return a comma-separated list of 5-10 technical keywords for schema searching.
+            Keywords:"""
+        )
+        return prompt | self.llm | StrOutputParser()
+
+    def create_schema_planner_chain(self):
+        """Create a chain that evaluates if the schema context is sufficient for the query"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured.")
+        prompt = ChatPromptTemplate.from_template(
+            """You are a Query Planner. Evaluate if the provided schema context is sufficient to answer the question.
+            Question: {Question}
+            
+            Current Schema Context:
+            {schema_context}
+            
+            Return ONLY a JSON object:
+            {{
+                "status": "ready" or "need_more_schema",
+                "missing_concepts": ["list", "of", "missing"],
+                "next_search_terms": ["keywords", "for", "missing", "entities"]
+            }}
+            """
+        )
+        return prompt | self.llm | StrOutputParser()
 
     def create_keyword_extraction_chain(self):
         """Create a chain to extract high-level keywords/entities for schema searching"""
         prompt = ChatPromptTemplate.from_template(
             """
-            You are a database expert. Given a natural language question about a database, 
-            extract a list of 3-5 core keywords or entities that are likely to represent table or column names 
-            relevant to the question. Focus on nouns and significant terms.
+            You are a database expert and business analyst. Given a natural language question about an ERP database, 
+            extract the most important technical keywords and their common abbreviations to help find relevant tables.
             
-            Return ONLY a comma-separated list of keywords, nothing else.
+            USER QUESTION: {Question}
             
-            Question: {Question}
+            RULES:
+            1. Extract nouns and entities (e.g., 'customer', 'invoice', 'ledger').
+            2. If you see 'General Ledger', include 'gl'.
+            3. If you see 'Accounts Payable', include 'ap'.
+            4. If you see 'Accounts Receivable', include 'ar'.
+            5. If you see 'Purchase Order', include 'po'.
+            6. If you see 'Goods Receipt', include 'grn'.
+            7. If you see 'Human Resources' or 'Employee', include 'hr'.
+            8. Include the schema name if mentioned (e.g., 'sales', 'finance').
+            9. Return ONLY a comma-separated list of keywords.
             
-            Keywords:
-            """
+            KEYWORDS:"""
         )
         return prompt | self.llm | StrOutputParser()
 
@@ -259,20 +329,23 @@ class LLMService:
             raise RuntimeError("LLM not configured.")
 
         prompt = ChatPromptTemplate.from_template(
-            """You are a PostgreSQL expert. Generate syntactically correct SQL for the following question.
-            Use ONLY the tables and columns provided in the schema context below.
-            
-            Schema Context:
-            {schema_context}
-            
-            User's Question: {Question}
-            
-            CRITICAL RULES:
-            - Use ONLY the provided tables and columns.
-            - Ensure correct JOIN conditions.
-            - Use proper PostgreSQL syntax.
-            - Return only the SQL query, no markdown, no explanation.
-            """
+            """You are a strict PostgreSQL SQL generator. Your ONLY job is to write SQL using the EXACT tables and columns listed below.
+
+AVAILABLE SCHEMA (you may ONLY use these tables and columns):
+{schema_context}
+
+User's Question: {Question}
+
+ABSOLUTE RULES - Violations will cause runtime errors:
+1. DO NOT use ANY table not explicitly listed in the schema above.
+2. DO NOT invent or guess column names. Use ONLY the exact column names shown above.
+3. DO NOT reference any table from your training data or general knowledge.
+4. Make your best effort to construct the query using the available schema context, even if some column names require an educated guess. Only return SELECT 'Insufficient schema context to answer this question' AS message; if the provided tables are completely irrelevant to the question.
+5. Return ONLY the raw SQL statement. No markdown, no ```, no explanation.
+6. Use correct PostgreSQL syntax with schema prefix where needed (e.g., hr.employees).
+7. Always add a LIMIT clause (default LIMIT 100) unless the question requires a full count.
+
+SQL Query:"""
         )
         return prompt | self.llm | StrOutputParser()
 
