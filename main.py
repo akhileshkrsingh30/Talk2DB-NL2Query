@@ -1,14 +1,25 @@
 import sys
 import io
-from fastapi import FastAPI, Depends, status
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from datetime import datetime
+import logging
 
 # Force UTF-8 encoding for Windows terminals to prevent 'charmap' codec errors
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# Configure logging EARLY (before any other imports that may call logging)
+# Direct all logs to stdout so they appear alongside print() in the terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
+    stream=sys.stdout,
+    force=True  # Override any handlers set by imported libraries
+)
+
+from fastapi import FastAPI, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from datetime import datetime
 
 from config import settings
 from routers import database, queries, sharing, llm_config, mongodb
@@ -21,6 +32,7 @@ from services.neo4j_service import Neo4jService
 from services.registry import service_registry
 from schemas import HealthCheck
 from dependencies import verify_token
+# logging is already configured at the top of this file
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -42,7 +54,20 @@ async def lifespan(app: FastAPI):
     service_registry.set_mongodb_service(mongodb_service)
     service_registry.set_neo4j_service(neo4j_service)
     
-    # Try to connect to database from environment variables
+    # 1. Connect to Neo4j first so it's ready for DB schema sync
+    if all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):
+        try:
+            print(f"Connecting to Neo4j at {settings.neo4j_uri}...")
+            neo4j_service.connect(
+                settings.neo4j_uri,
+                settings.neo4j_user,
+                settings.neo4j_password
+            )
+            print("Neo4j connected successfully")
+        except Exception as e:
+            print(f"Neo4j auto-connection failed: {e}")
+
+    # 2. Try to connect to database and sync to Neo4j if available
     if all([settings.db_host, settings.db_port, settings.db_name, settings.db_user]):
         try:
             print(f"Connecting to database {settings.db_name} at {settings.db_host}...")
@@ -71,19 +96,6 @@ async def lifespan(app: FastAPI):
                 print(f"Failed to sync schema to Neo4j during auto-connect: {e}")
         except Exception as e:
             print(f"Database auto-connection failed: {e}")
-
-    # Try to connect to Neo4j
-    if all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):
-        try:
-            print(f"Connecting to Neo4j at {settings.neo4j_uri}...")
-            neo4j_service.connect(
-                settings.neo4j_uri,
-                settings.neo4j_user,
-                settings.neo4j_password
-            )
-            print("Neo4j connected successfully")
-        except Exception as e:
-            print(f"Neo4j auto-connection failed: {e}")
 
     # Try to configure LLM from environment variables
     # Use Krutim if key is provided, otherwise fallback to OpenAI

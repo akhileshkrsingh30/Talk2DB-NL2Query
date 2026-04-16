@@ -83,14 +83,15 @@ class Neo4jService:
             table_params.append({
                 "schema_full_name": f"{db_name}.{s_name}",
                 "table_name": t["name"],
-                "full_name": f"{db_name}.{s_name}.{t['name']}"
+                "full_name": f"{db_name}.{s_name}.{t['name']}",
+                "est_rows": t.get("estimated_rows", 0)
             })
         
         tx.run("""
             UNWIND $tables as t_data
             MATCH (s:Schema {full_name: t_data.schema_full_name})
             MERGE (t:Table {full_name: t_data.full_name})
-            SET t.name = t_data.table_name
+            SET t.name = t_data.table_name, t.estimated_rows = t_data.est_rows
             MERGE (s)-[:HAS_TABLE]->(t)
         """, tables=table_params)
 
@@ -141,32 +142,113 @@ class Neo4jService:
             """, fks=fk_params)
 
     def find_relevant_schema(self, db_name: str, keywords: List[str]) -> List[Dict[str, Any]]:
-        """Find relevant tables and their columns based on keywords, following relationships"""
+        """Find relevant tables with hybrid-like ranking and boosting"""
         if not self._connected:
             return []
             
+        logging.info(f"[Neo4j] Hybrid Discovery for DB: '{db_name}' with keywords: {keywords}")
         with self.driver.session(database="neo4j") as session:
-            # Query to find tables that match keywords or have columns matching keywords
-            # Then follow REFERENCES relationships (up to 1 hop) to find connected tables
-            # Higher weight/ranking could be added, but for now we take distinct set
-            # Case-insensitive matching used for robustness
+            # Flatten keywords and split multi-word phrases into individual search terms
+            search_terms = []
+            for kw in keywords:
+                # Add the full phrase
+                search_terms.append(kw.lower())
+                # Add individual words if it's a phrase
+                if " " in kw:
+                    search_terms.extend([word.lower() for word in kw.split() if len(word) > 2])
+            
+            search_terms = list(set(search_terms)) # Unique terms
+            logging.info(f"[Neo4j] Searching graph for terms: {search_terms}")
+            
+            # Implementation of Hybrid-like ranking and boosting
+            # 1. Exact matches get higher weight (rank=10)
+            # 2. Contains matches get rank=5
+            # 3. 'Employee' boosting: if ANY search term contains 'employee', tables/columns with 'employee' get rank + 50
+            
+            has_employee_kw = any("employee" in t for t in search_terms)
+            
             query = """
             MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(s)-[:HAS_TABLE]->(t:Table)
-            WHERE any(kw IN $keywords WHERE toLower(t.name) CONTAINS toLower(kw))
-               OR any(kw IN $keywords WHERE EXISTS {
-                   MATCH (t)-[:HAS_COLUMN]->(c:Column)
-                   WHERE toLower(c.name) CONTAINS toLower(kw)
-               })
             
-            // Collect matching tables and their immediate neighbors
-            OPTIONAL MATCH (t)-[:REFERENCES*0..1]-(related:Table)
-            WITH DISTINCT CASE WHEN related IS NOT NULL THEN related ELSE t END as table_node
+            // Calculate Match Score (Hybrid Keyword Rank)
+            WITH t, 
+                 CASE 
+                    WHEN any(kw IN $keywords WHERE toLower(t.name) = kw) THEN 100
+                    WHEN any(kw IN $keywords WHERE toLower(t.name) CONTAINS kw OR kw CONTAINS toLower(t.name)) THEN 50
+                    ELSE 0
+                 END as table_score,
+                 CASE
+                    WHEN EXISTS {
+                        MATCH (t)-[:HAS_COLUMN]->(c:Column)
+                        WHERE any(kw IN $keywords WHERE toLower(c.name) = kw)
+                    } THEN 30
+                    WHEN EXISTS {
+                        MATCH (t)-[:HAS_COLUMN]->(c:Column)
+                        WHERE any(kw IN $keywords WHERE toLower(c.name) CONTAINS kw OR kw CONTAINS toLower(c.name))
+                    } THEN 10
+                    ELSE 0
+                 END as col_score
             
-            // Get columns for these tables
+            WHERE table_score > 0 OR col_score > 0
+            
+            // Apply Employee Boost and Row Count Penalty
+            WITH t, (table_score + col_score) as base_score,
+                 CASE 
+                    WHEN $boost_employee AND (toLower(t.name) CONTAINS 'employee' OR EXISTS {
+                        MATCH (t)-[:HAS_COLUMN]->(c:Column)
+                        WHERE toLower(c.name) CONTAINS 'employee'
+                    }) THEN 500
+                    ELSE 0
+                 END as boost_score,
+                 // Penalize empty tables but don't eradicate them if they match keywords well
+                 // Give a slight bonus based on log of row count for non-empty tables
+                 CASE
+                    WHEN t.estimated_rows IS NULL OR t.estimated_rows <= 0 THEN -10
+                    ELSE log10(tofloat(t.estimated_rows) + 1.0) * 20
+                 END as count_score
+            
+            WITH t, (base_score + boost_score + count_score) as final_score
+            ORDER BY final_score DESC
+            LIMIT 30 // Initial candidate pool
+            
+            // Include Related Tables (FK Relationships)
+            OPTIONAL MATCH (t)-[r:REFERENCES]-(related:Table)
+            WITH DISTINCT CASE WHEN related IS NOT NULL THEN related ELSE t END as table_node, final_score
+            
+            // Aggregated return
             MATCH (table_node)-[:HAS_COLUMN]->(col:Column)
             RETURN table_node.name as table_name, 
                    table_node.full_name as full_name,
-                   collect({name: col.name, type: col.type}) as columns
+                   collect({name: col.name, type: col.type}) as columns,
+                   max(final_score) as score
+            ORDER BY score DESC
             """
-            result = session.run(query, db_name=db_name, keywords=keywords)
+            result = session.run(query, db_name=db_name, keywords=search_terms, boost_employee=has_employee_kw)
+            return [record.data() for record in result]
+
+    def get_path_bridges(self, db_name: str, table_full_names: List[str]) -> List[Dict[str, Any]]:
+        """Find bridging tables that connect the provided anchor tables using shortest path discovery"""
+        if not self._connected or len(table_full_names) < 2:
+            return []
+            
+        logging.info(f"[Neo4j] Finding join paths between {len(table_full_names)} anchors...")
+        with self.driver.session(database="neo4j") as session:
+            # Use shortestPath to find the connecting bridges (limit 3 hops for performance)
+            query = """
+            UNWIND $anchors as a1_name
+            UNWIND $anchors as a2_name
+            WITH a1_name, a2_name WHERE a1_name < a2_name
+            MATCH (t1:Table {full_name: a1_name}), (t2:Table {full_name: a2_name})
+            MATCH p = shortestPath((t1)-[:REFERENCES*..3]-(t2))
+            UNWIND nodes(p) as bridge
+            WITH DISTINCT bridge
+            WHERE NOT bridge.full_name IN $anchors
+            
+            MATCH (bridge)-[:HAS_COLUMN]->(col:Column)
+            RETURN bridge.name as table_name, 
+                   bridge.full_name as full_name,
+                   collect({name: col.name, type: col.type}) as columns,
+                   'bridge' as role
+            """
+            result = session.run(query, anchors=table_full_names)
             return [record.data() for record in result]

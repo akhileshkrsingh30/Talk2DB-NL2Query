@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: nl2query-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./shared_results:/app/shared_results
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  sync-daemon:
+    build: .
+    container_name: nl2query-sync-daemon
+    command: python schema_sync_daemon.py
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - api

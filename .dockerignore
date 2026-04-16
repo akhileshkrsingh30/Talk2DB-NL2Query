@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.env
+.git/
+.github/
+*.log
+output.txt
+inventory_tables_with_counts.txt
+shared_results/
+Dockerfile
+docker-compose.yml
+.vscode/
+.idea/
