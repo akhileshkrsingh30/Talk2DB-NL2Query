@@ -188,17 +188,17 @@ class LLMService:
         self.config_details = None
         print("LLM configuration reset")
     
-    def create_sql_chain(self, db):
+    def create_sql_chain(self, db, dialect="postgresql"):
         """Create SQL query chain"""
         if not self.is_configured():
             raise RuntimeError("LLM not configured. Cannot create SQL chain.")
             
         prompt = ChatPromptTemplate.from_template(
-            """You are a PostgreSQL expert. Generate syntactically correct SQL for the following question.
+            f"""You are a {dialect.upper()} expert. Generate syntactically correct SQL for the following question.
             Return only SQL. Use this database schema:
-            {schema_info}
+            {{schema_info}}
 
-            Question: {Question}
+            Question: {{Question}}
 
             CRITICAL RULES:
             - Use ONLY the exact column names provided in the schema above
@@ -208,6 +208,7 @@ class LLMService:
             - For date/timestamp columns, verify the exact column name from the schema (e.g., order_date, created_at)
             - Check join connectivity before generating; do not assume join paths if keys are not visible in the capsules
             - Return only the SQL query, no explanations or markdown
+            - Use exact syntax for {dialect.upper()}.
             """
         )
         return prompt | self.llm | StrOutputParser()
@@ -323,18 +324,18 @@ class LLMService:
         )
         return prompt | self.llm | StrOutputParser()
 
-    def create_sql_generation_chain(self):
+    def create_sql_generation_chain(self, dialect="postgresql"):
         """Step 2: Generate final SQL from filtered schema context"""
         if not self.is_configured():
             raise RuntimeError("LLM not configured.")
 
         prompt = ChatPromptTemplate.from_template(
-            """You are a strict PostgreSQL SQL generator. Your ONLY job is to write SQL using the EXACT tables and columns listed below.
+            f"""You are a strict {dialect.upper()} SQL generator. Your ONLY job is to write SQL using the EXACT tables and columns listed below.
 
 AVAILABLE SCHEMA (you may ONLY use these tables and columns):
-{schema_context}
+{{schema_context}}
 
-User's Question: {Question}
+User's Question: {{Question}}
 
 ABSOLUTE RULES - Violations will cause runtime errors:
 1. DO NOT use ANY table not explicitly listed in the schema above.
@@ -342,8 +343,8 @@ ABSOLUTE RULES - Violations will cause runtime errors:
 3. DO NOT reference any table from your training data or general knowledge.
 4. Make your best effort to construct the query using the available schema context, even if some column names require an educated guess. Only return SELECT 'Insufficient schema context to answer this question' AS message; if the provided tables are completely irrelevant to the question.
 5. Return ONLY the raw SQL statement. No markdown, no ```, no explanation.
-6. Use correct PostgreSQL syntax with schema prefix where needed (e.g., hr.employees).
-7. Always add a LIMIT clause (default LIMIT 100) unless the question requires a full count.
+6. Use correct {dialect.upper()} syntax.
+7. Always limit the results unless the question requires a full count. (Use LIMIT for Postgres/MySQL, TOP for MSSQL, FETCH FIRST for Oracle).
 
 SQL Query:"""
         )

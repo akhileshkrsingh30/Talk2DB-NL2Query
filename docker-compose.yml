@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   api:
     build: .
@@ -8,9 +6,14 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/
+      - NEO4J_URI=bolt://neo4j:7687
     volumes:
       - ./shared_results:/app/shared_results
     restart: unless-stopped
+    depends_on:
+      - neo4j
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -23,6 +26,25 @@ services:
     command: python schema_sync_daemon.py
     env_file:
       - .env
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/
+      - NEO4J_URI=bolt://neo4j:7687
     restart: unless-stopped
     depends_on:
       - api
+      - neo4j
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: nl2query-neo4j
+    ports:
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/Akhilesh842@
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:

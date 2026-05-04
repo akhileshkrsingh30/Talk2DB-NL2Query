@@ -34,6 +34,8 @@ def get_query_service(
     # Always create a fresh instance to ensure we have the latest service states
     return QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
 
+from fastapi.responses import StreamingResponse
+
 @router.post("/process", response_model=QueryResult, responses={400: {"model": ErrorResponse}})
 async def process_natural_language_query(
     query_request: QueryRequest,
@@ -78,6 +80,26 @@ async def process_natural_language_query(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Query processing failed: {str(e)}"
         )
+
+@router.post("/stream")
+async def stream_natural_language_query(
+    query_request: QueryRequest,
+    query_service: Annotated[QueryService, Depends(get_query_service)],
+    current_user: Annotated[str, Depends(verify_token)]
+):
+    """Stream natural language query results chunk by chunk"""
+    return StreamingResponse(
+        query_service.stream_query(
+            user_query=query_request.query,
+            max_tokens=query_request.max_tokens,
+            temperature=query_request.temperature,
+            user_id=current_user,
+            session_id=query_request.session_id,
+            message_id=query_request.message_id,
+            company_id=query_request.company_id
+        ),
+        media_type="application/x-ndjson"
+    )
 
 @router.post("/process-batch", response_model=BatchQueryResult, responses={400: {"model": ErrorResponse}})
 async def process_natural_language_query_batch(

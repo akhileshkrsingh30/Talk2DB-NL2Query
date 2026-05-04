@@ -60,6 +60,16 @@ try:
 except ImportError:
     mysql = None
 
+try:
+    import pymssql
+except ImportError:
+    pymssql = None
+
+try:
+    import oracledb
+except ImportError:
+    oracledb = None
+
 
 class DatabaseService:
     def __init__(self):
@@ -111,6 +121,31 @@ class DatabaseService:
                         cursor.execute("SELECT VERSION()")
                     self.db_version = cursor.fetchone()[0]
                     cursor.close()
+            elif self.db_type == "mssql":
+                if pymssql is None:
+                    raise ImportError("pymssql is not installed. Required for MSSQL support.")
+                with pymssql.connect(
+                    server=connection_params["host"],
+                    port=connection_params["port"],
+                    user=connection_params["user"],
+                    password=connection_params["password"],
+                    database=db_name or "master",
+                    login_timeout=5
+                ) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT @@VERSION")
+                        row = cursor.fetchone()
+                        self.db_version = row[0] if row else "Unknown MSSQL Version"
+            elif self.db_type == "oracle":
+                if oracledb is None:
+                    raise ImportError("oracledb is not installed. Required for Oracle support.")
+                dsn = f"{connection_params['host']}:{connection_params['port']}/{db_name}" if db_name else f"{connection_params['host']}:{connection_params['port']}"
+                with oracledb.connect(
+                    user=connection_params["user"],
+                    password=connection_params["password"],
+                    dsn=dsn
+                ) as conn:
+                    self.db_version = conn.version
             else:
                 # Default to PostgreSQL
                 if not db_name:
@@ -138,7 +173,7 @@ class DatabaseService:
             
         except Exception as e:
             self.connected = False
-            if "psycopg2" in str(e) or "mysql" in str(e):
+            if any(driver in str(e) for driver in ["psycopg2", "mysql", "pymssql", "oracledb"]):
                 raise ConnectionError(f"Database connection failed: {str(e)}")
             raise RuntimeError(f"Connection error: {str(e)}")
     
@@ -171,6 +206,10 @@ class DatabaseService:
                 cursor = conn.cursor()
                 if self.db_type in ["mysql", "mariadb"]:
                     cursor.execute("SHOW DATABASES")
+                elif self.db_type == "mssql":
+                    cursor.execute("SELECT name FROM sys.databases WHERE state_desc = 'ONLINE'")
+                elif self.db_type == "oracle":
+                    cursor.execute("SELECT DISTINCT owner FROM all_tables")
                 else:
                     cursor.execute("SELECT datname FROM pg_database WHERE datistemplate = false;")
                 
@@ -178,6 +217,10 @@ class DatabaseService:
                 # Handle both tuple and dictionary results
                 if self.db_type in ["mysql", "mariadb"]:
                     return [row[0] if isinstance(row, tuple) else row['Database'] for row in rows]
+                elif self.db_type == "mssql":
+                    return [row['name'] if isinstance(row, dict) else row[0] for row in rows]
+                elif self.db_type == "oracle":
+                    return [row[0] for row in rows]
                 else:
                     return [row['datname'] if isinstance(row, dict) else row[0] for row in rows]
         except Exception as e:
@@ -206,6 +249,27 @@ class DatabaseService:
                     with conn.cursor() as cursor:
                         cursor.execute("SELECT VERSION()")
                     self.db_version = cursor.fetchone()[0]
+            elif self.db_type == "mssql":
+                with pymssql.connect(
+                    server=new_params["host"],
+                    port=new_params["port"],
+                    user=new_params["user"],
+                    password=new_params["password"],
+                    database=new_params["database"],
+                    login_timeout=5
+                ) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT @@VERSION")
+                        row = cursor.fetchone()
+                        self.db_version = row[0] if row else "Unknown MSSQL Version"
+            elif self.db_type == "oracle":
+                dsn = f"{new_params['host']}:{new_params['port']}/{new_params['database']}"
+                with oracledb.connect(
+                    user=new_params["user"],
+                    password=new_params["password"],
+                    dsn=dsn
+                ) as conn:
+                    self.db_version = conn.version
             else:
                 with psycopg2.connect(
                     host=new_params["host"],
@@ -243,6 +307,23 @@ class DatabaseService:
                 password=self.connection_params["password"],
                 cursorclass=mysql.cursors.DictCursor
             )
+        elif self.db_type == "mssql":
+            # pymssql supports as_dict=True
+            return pymssql.connect(
+                server=self.connection_params["host"],
+                port=self.connection_params["port"],
+                user=self.connection_params["user"],
+                password=self.connection_params["password"],
+                database=self.connection_params["database"] or "master",
+                as_dict=True
+            )
+        elif self.db_type == "oracle":
+            dsn = f"{self.connection_params['host']}:{self.connection_params['port']}/{self.connection_params['database']}" if self.connection_params['database'] else f"{self.connection_params['host']}:{self.connection_params['port']}"
+            return oracledb.connect(
+                user=self.connection_params["user"],
+                password=self.connection_params["password"],
+                dsn=dsn
+            )
         else:
             return psycopg2.connect(
                 host=self.connection_params["host"],
@@ -266,6 +347,10 @@ class DatabaseService:
         
         if self.db_type in ["mysql", "mariadb"]:
             db_uri = f"mysql+mysqlconnector://{username}:{password}@{host}:{port}/{dbname}"
+        elif self.db_type == "mssql":
+            db_uri = f"mssql+pymssql://{username}:{password}@{host}:{port}/{dbname}"
+        elif self.db_type == "oracle":
+            db_uri = f"oracle+oracledb://{username}:{password}@{host}:{port}/{dbname}"
         else:
             db_uri = f"postgresql://{username}:{password}@{host}:{port}/{dbname}"
             
@@ -291,7 +376,7 @@ class DatabaseService:
                         logging.info(f"   [OK] DB Response: {len(dict_results)} rows in {elapsed:.3f}s")
                         return dict_results
                     else:
-                        if self.db_type not in ["mysql", "mariadb"]: # MySQL autocommits usually or handles via connection
+                        if self.db_type not in ["mysql", "mariadb", "mssql", "oracle"]: # MySQL autocommits usually or handles via connection
                             conn.commit()
                         elapsed = time.time() - start_time
                         logging.info(f"   [OK] Command executed: {cursor.rowcount} rows affected in {elapsed:.3f}s")
@@ -301,7 +386,7 @@ class DatabaseService:
                             "query": sql_query.strip()
                         }
                         
-        except psycopg2.Error as e:
+        except Exception as e:
             raise RuntimeError(f"Query execution failed: {str(e)}")
 
     def get_simplified_schema(self) -> str:
@@ -341,6 +426,49 @@ class DatabaseService:
                         """, (self.connection_params["database"],)
                     )
                     pk_rows = cursor.fetchall()
+                elif self.db_type == "mssql":
+                    cursor.execute(
+                        """
+                        SELECT TABLE_SCHEMA as table_schema, TABLE_NAME as table_name, COLUMN_NAME as column_name, DATA_TYPE as data_type, IS_NULLABLE as is_nullable, ORDINAL_POSITION as ordinal_position
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+                        """
+                    )
+                    cols = [dict(r) if hasattr(r, 'keys') else {"table_schema": r[0], "table_name": r[1], "column_name": r[2], "data_type": r[3], "is_nullable": r[4], "ordinal_position": r[5]} for r in cursor.fetchall()]
+                    
+                    cursor.execute(
+                        """
+                        SELECT kcu.TABLE_SCHEMA as table_schema, kcu.TABLE_NAME as table_name, kcu.COLUMN_NAME as column_name
+                        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                        """
+                    )
+                    pk_rows = [dict(r) if hasattr(r, 'keys') else {"table_schema": r[0], "table_name": r[1], "column_name": r[2]} for r in cursor.fetchall()]
+                elif self.db_type == "oracle":
+                    cursor.execute(
+                        """
+                        SELECT owner as table_schema, table_name, column_name, data_type, nullable as is_nullable, column_id as ordinal_position
+                        FROM all_tab_columns
+                        WHERE owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        ORDER BY owner, table_name, column_id
+                        """
+                    )
+                    cols_raw = cursor.fetchall()
+                    cols = [{"table_schema": r[0], "table_name": r[1], "column_name": r[2], "data_type": r[3], "is_nullable": 'YES' if r[4] == 'Y' else 'NO', "ordinal_position": r[5]} for r in cols_raw]
+                    
+                    cursor.execute(
+                        """
+                        SELECT cols.owner as table_schema, cols.table_name, cols.column_name
+                        FROM all_constraints cons, all_cons_columns cols
+                        WHERE cons.constraint_type = 'P'
+                        AND cons.constraint_name = cols.constraint_name
+                        AND cons.owner = cols.owner
+                        AND cons.owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        """
+                    )
+                    pk_raw = cursor.fetchall()
+                    pk_rows = [{"table_schema": r[0], "table_name": r[1], "column_name": r[2]} for r in pk_raw]
                 else:
                     cursor.execute(
                         """
@@ -461,6 +589,122 @@ class DatabaseService:
                         """, (self.connection_params["database"],)
                     )
                     count_rows = cursor.fetchall()
+                elif self.db_type == "mssql":
+                    # Get tables and columns for MSSQL
+                    cursor.execute(
+                        """
+                        SELECT TABLE_SCHEMA as table_schema, TABLE_NAME as table_name, COLUMN_NAME as column_name, DATA_TYPE as data_type, IS_NULLABLE as is_nullable, ORDINAL_POSITION as ordinal_position
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+                        """
+                    )
+                    cols = [dict(r) if hasattr(r, 'keys') else {"table_schema": r[0], "table_name": r[1], "column_name": r[2], "data_type": r[3], "is_nullable": r[4], "ordinal_position": r[5]} for r in cursor.fetchall()]
+                    
+                    # Get primary keys
+                    cursor.execute(
+                        """
+                        SELECT kcu.TABLE_SCHEMA as table_schema, kcu.TABLE_NAME as table_name, kcu.COLUMN_NAME as column_name
+                        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                        """
+                    )
+                    pk_rows = [dict(r) if hasattr(r, 'keys') else {"table_schema": r[0], "table_name": r[1], "column_name": r[2]} for r in cursor.fetchall()]
+
+                    # Get foreign keys
+                    cursor.execute(
+                        """
+                        SELECT
+                            tp.name AS table_name,
+                            cp.name AS column_name,
+                            tr.name AS referred_table,
+                            SCHEMA_NAME(tr.schema_id) AS referred_schema
+                        FROM 
+                            sys.foreign_keys fk
+                        INNER JOIN 
+                            sys.tables tp ON fk.parent_object_id = tp.object_id
+                        INNER JOIN 
+                            sys.tables tr ON fk.referenced_object_id = tr.object_id
+                        INNER JOIN 
+                            sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+                        INNER JOIN 
+                            sys.columns cp ON fkc.parent_column_id = cp.column_id AND fkc.parent_object_id = cp.object_id
+                        """
+                    )
+                    fk_rows = [dict(r) if hasattr(r, 'keys') else {"table_name": r[0], "column_name": r[1], "referred_table": r[2], "referred_schema": r[3]} for r in cursor.fetchall()]
+                    
+                    # Get estimated row counts
+                    cursor.execute(
+                        """
+                        SELECT
+                            s.name AS table_schema,
+                            t.name AS table_name,
+                            p.rows AS row_count
+                        FROM
+                            sys.tables t
+                        INNER JOIN
+                            sys.indexes i ON t.object_id = i.object_id
+                        INNER JOIN
+                            sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+                        INNER JOIN 
+                            sys.schemas s ON t.schema_id = s.schema_id
+                        WHERE
+                            t.is_ms_shipped = 0 AND i.type IN (0,1)
+                        """
+                    )
+                    count_rows = [dict(r) if hasattr(r, 'keys') else {"table_schema": r[0], "table_name": r[1], "row_count": r[2]} for r in cursor.fetchall()]
+                elif self.db_type == "oracle":
+                    # Get tables and columns for Oracle
+                    cursor.execute(
+                        """
+                        SELECT owner as table_schema, table_name, column_name, data_type, nullable as is_nullable, column_id as ordinal_position
+                        FROM all_tab_columns
+                        WHERE owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        ORDER BY owner, table_name, column_id
+                        """
+                    )
+                    cols_raw = cursor.fetchall()
+                    cols = [{"table_schema": r[0], "table_name": r[1], "column_name": r[2], "data_type": r[3], "is_nullable": 'YES' if r[4] == 'Y' else 'NO', "ordinal_position": r[5]} for r in cols_raw]
+                    
+                    # Get primary keys
+                    cursor.execute(
+                        """
+                        SELECT cols.owner as table_schema, cols.table_name, cols.column_name
+                        FROM all_constraints cons, all_cons_columns cols
+                        WHERE cons.constraint_type = 'P'
+                        AND cons.constraint_name = cols.constraint_name
+                        AND cons.owner = cols.owner
+                        AND cons.owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        """
+                    )
+                    pk_raw = cursor.fetchall()
+                    pk_rows = [{"table_schema": r[0], "table_name": r[1], "column_name": r[2]} for r in pk_raw]
+
+                    # Get foreign keys
+                    cursor.execute(
+                        """
+                        SELECT a.table_name, a.column_name, c_pk.table_name as referred_table, c_pk.owner as referred_schema
+                        FROM all_cons_columns a
+                        JOIN all_constraints c ON a.owner = c.owner AND a.constraint_name = c.constraint_name
+                        JOIN all_constraints c_pk ON c.r_owner = c_pk.owner AND c.r_constraint_name = c_pk.constraint_name
+                        WHERE c.constraint_type = 'R'
+                        AND a.owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        """
+                    )
+                    fk_raw = cursor.fetchall()
+                    fk_rows = [{"table_name": r[0], "column_name": r[1], "referred_table": r[2], "referred_schema": r[3]} for r in fk_raw]
+                    
+                    # Get estimated row counts
+                    cursor.execute(
+                        """
+                        SELECT owner as table_schema, table_name, num_rows as row_count
+                        FROM all_tables
+                        WHERE owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        AND num_rows IS NOT NULL
+                        """
+                    )
+                    count_raw = cursor.fetchall()
+                    count_rows = [{"table_schema": r[0], "table_name": r[1], "row_count": r[2]} for r in count_raw]
                 else:
                     # Get tables and columns for PostgreSQL
                     cursor.execute(
