@@ -8,7 +8,7 @@ class DatabaseConnection(BaseModel):
     database: Optional[str] = Field(None, description="Database name (optional, defaults to 'postgres' if not provided)")
     user: str = Field(..., description="Database username")
     password: str = Field(..., description="Database password")
-    db_type: Optional[str] = Field("postgresql", description="Database type (postgresql, mysql, mariadb)")
+    db_type: Optional[str] = Field("postgresql", description="Database type (postgresql, mysql, mariadb, mssql, oracle)")
 
 class DatabaseSelect(BaseModel):
     database: str = Field(..., description="Database name to switch to")

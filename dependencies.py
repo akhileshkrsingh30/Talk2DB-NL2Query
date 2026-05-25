@@ -111,9 +111,21 @@ def get_mongodb_service() -> MongoDBService:
         )
 
 def get_neo4j_service() -> Neo4jService:
-    """Dependency to get Neo4j service instance"""
+    """Dependency to get Neo4j service instance with auto-reconnect logic"""
     try:
-        return service_registry.get_neo4j_service()
+        service = service_registry.get_neo4j_service()
+        # If not connected, try to auto-connect using environment settings
+        if not service.is_connected():
+            if all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):
+                try:
+                    service.connect(
+                        settings.neo4j_uri,
+                        settings.neo4j_user,
+                        settings.neo4j_password
+                    )
+                except Exception:
+                    pass # Fail silently, Step 1 in query will log the warning if still fails
+        return service
     except RuntimeError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

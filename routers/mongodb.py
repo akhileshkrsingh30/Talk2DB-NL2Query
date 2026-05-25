@@ -311,6 +311,38 @@ async def get_collection_schema(
             detail=f"Failed to get schema: {str(e)}"
         )
 
+from fastapi.responses import StreamingResponse
+
+@router.post("/stream")
+async def stream_mongodb_query(
+    query_request: MongoDBQueryRequest,
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
+    llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    current_user: Annotated[str, Depends(verify_token)]
+):
+    """Stream natural language query results for MongoDB chunk by chunk"""
+    # Validate prerequisites
+    if not mongodb_service.is_connected():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MongoDB not connected. Please connect first."
+        )
+    if not mongodb_service.current_collection:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No collection selected."
+        )
+    if not llm_service.is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="LLM is not configured."
+        )
+
+    return StreamingResponse(
+        mongodb_service.stream_query(query_request, llm_service, current_user),
+        media_type="application/x-ndjson"
+    )
+
 @router.post("/process", response_model=MongoDBQueryResult, responses={400: {"model": ErrorResponse}})
 async def process_mongodb_query(
     query_request: MongoDBQueryRequest,

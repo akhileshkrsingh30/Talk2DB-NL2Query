@@ -120,37 +120,14 @@ class QueryService:
                 else:
                     logging.warning("⚠️ [STEP 1] Neo4j service is NOT connected. Skipping graph search.")
                 
-                # Fallback to MongoDB if Neo4j failed or returned nothing
-                if not schema_context and self.mongodb_service:
-                    logging.info(f"[STEP 1] Falling back to MongoDB for DB: '{db_name}'...")
-                    search_chain = self.llm_service.create_table_search_mongodb_chain()
-                    mongo_filter_text = search_chain.invoke({"Question": user_query})
-                    
-                    clean_filter = mongo_filter_text.strip()
-                    if clean_filter.startswith("```"):
-                       if "json" in clean_filter:
-                           clean_filter = clean_filter.split("json", 1)[1].rsplit("```", 1)[0].strip()
-                       else:
-                           clean_filter = clean_filter.split("```", 1)[1].rsplit("```", 1)[0].strip()
-                    
-                    filter_json = json.loads(clean_filter)
-                    relevant_table_docs = self.mongodb_service.query_table_metadata(host, db_name, filter_json)
-                    
-                    if relevant_table_docs:
-                        schema_context = f"Relevant Tables for database '{db_name}' (discovered via MongoDB):\n"
-                        for doc in relevant_table_docs[:15]:
-                            schema_name = doc.get("schema", "public")
-                            cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in doc.get("columns", [])])
-                            schema_context += f"- Table: {schema_name}.{doc['table']} (Columns: {cols_desc})\n"
-
-                # Final fallback to simplified full schema
+                # Fallback to PostgreSQL if Neo4j discovery yielded no results
                 if not schema_context:
-                    if is_meta_query:
-                        logging.info("[STEP 1] Injecting metadata schema context (information_schema)...")
-                        schema_context = self._get_meta_context(db_name)
+                    logging.warning("⚠️ [STEP 1] Neo4j returned no schema context. Falling back to PostgreSQL simplified schema...")
+                    schema_context = self.db_service.get_simplified_schema()
+                    if schema_context:
+                        logging.info("[STEP 1] Successfully retrieved simplified schema from PostgreSQL.")
                     else:
-                        logging.info("[STEP 1] No discovery possible. Using full simplified schema.")
-                        schema_context = self.db_service.get_simplified_schema()
+                        logging.error("[STEP 1] PostgreSQL simplified schema is also empty.")
             
             except Exception as discovery_err:
                 err_str = str(discovery_err)
@@ -164,8 +141,14 @@ class QueryService:
                 if any(x in err_str for x in ["Connection error", "Connection refused", "unreachable", "10061"]):
                     logging.warning(f"⚠️ [STEP 1] LLM Service unreachable during discovery: {err_str}. Discovery skipped.")
                 else:
-                    logging.error(f"[ERROR] Schema discovery failed: {err_str}. Falling back to full schema.")
-                schema_context = self.db_service.get_simplified_schema()
+                    logging.error(f"[ERROR] Schema discovery failed: {err_str}.")
+                
+                # Fallback to PostgreSQL simplified schema on any discovery error
+                logging.warning("⚠️ [STEP 1] Falling back to PostgreSQL simplified schema due to discovery error...")
+                try:
+                    schema_context = self.db_service.get_simplified_schema()
+                except Exception as pg_err:
+                    logging.error(f"[ERROR] PostgreSQL fallback also failed: {pg_err}")
             
             # Final safety truncation (based on configured context window)
             if len(schema_context) > settings.llm_max_context_chars:
@@ -174,8 +157,9 @@ class QueryService:
             logging.info(f"--- FINAL SCHEMA CONTEXT SENT TO LLM ---\n{schema_context}\n----------------------------------------")
             
             # 2. GENERATE SQL (LLM CALL 2)
-            logging.info(f"[STEP 2] Generating PostgreSQL SQL for DB: '{db_name}'...")
-            sql_gen_chain = self.llm_service.create_sql_generation_chain()
+            dialect = self.db_service.db_type
+            logging.info(f"[STEP 2] Generating {dialect.upper()} SQL for DB: '{db_name}'...")
+            sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
             
             # Update tokens for Step 2
             input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
@@ -216,28 +200,8 @@ class QueryService:
             # Extract SQL queries
             sql_queries = extract_sql_queries(str(generated_text))
             
-            # Check for insufficient schema fallback
-            is_insufficient = False
-            if sql_queries and len(sql_queries) > 0:
-                if "insufficient schema context" in sql_queries[0].lower():
-                    is_insufficient = True
-                    
-            if is_insufficient:
-                logging.warning("[STEP 2] LLM reported insufficient schema context. Falling back to full PostgreSQL database schema...")
-                full_schema_context = self.db_service.get_simplified_schema()
-                
-                if len(full_schema_context) > settings.llm_max_context_chars:
-                    full_schema_context = full_schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated for size...]"
-                
-                logging.info("[STEP 2] Re-generating SQL with full fallback schema...")
-                input_tokens += self.count_tokens(full_schema_context)
-                
-                generated_text = sql_gen_chain.invoke({
-                    "Question": user_query,
-                    "schema_context": full_schema_context
-                })
-                output_tokens += self.count_tokens(str(generated_text))
-                sql_queries = extract_sql_queries(str(generated_text))
+            # Removed insufficient schema fallback to PostgreSQL.
+            # If the LLM generates 'Insufficient schema context', it will be executed and return a message to the user.
             
             if not sql_queries:
                 raise ValueError(f"No SQL queries generated for '{db_name}' from the LLM response.")
@@ -328,10 +292,101 @@ class QueryService:
             
             logging.info(f"[INFO] Query processed successfully in {execution_time:.2f}s | Tokens: In={input_tokens}, Out={output_tokens}")
             return response
-            
+
         except Exception as e:
-            print(f"[FAIL] Query processing failed: {str(e)}")
-            raise RuntimeError(f"Query processing failed: {str(e)}")
+            logging.error(f"[ERROR] process_query failed: {e}")
+            raise
+            
+    async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
+                          user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None):
+        """Process natural language query and stream results chunk by chunk"""
+        start_time = time.time()
+        input_tokens = self.count_tokens(user_query)
+        output_tokens = 0
+        
+        try:
+            # 1. Validation & Initialization
+            self.validate_prerequisites()
+            yield json.dumps({"type": "status", "content": "Analyzing query and discovering schema..."}) + "\n"
+            
+            db_params = self.db_service.get_connection_params()
+            db_name = db_params.get("database", "unknown")
+            
+            # 2. Schema Discovery (Step 1)
+            schema_context = ""
+            if self.neo4j_service and self.neo4j_service.is_connected():
+                try:
+                    concept_chain = self.llm_service.create_concept_extraction_chain()
+                    keywords_text = await concept_chain.ainvoke({"Question": user_query})
+                    keywords = [k.strip() for k in keywords_text.split(",") if k.strip()]
+                    
+                    anchors = self.neo4j_service.find_relevant_schema(db_name, keywords)
+                    if anchors:
+                        anchor_full_names = [a['full_name'] for a in anchors[:8]]
+                        bridges = self.neo4j_service.get_path_bridges(db_name, anchor_full_names)
+                        all_relevant_nodes = anchors + bridges
+                        schema_context = self._format_schema_capsules(all_relevant_nodes[:40], db_name)
+                except Exception as e:
+                    logging.warning(f"Neo4j discovery failed during stream: {e}")
+
+            # Fallback to Postgres if Neo4j failed or returned nothing
+            if not schema_context:
+                yield json.dumps({"type": "status", "content": "Neo4j unavailable, falling back to PostgreSQL schema..."}) + "\n"
+                schema_context = self.db_service.get_simplified_schema()
+
+            # 3. SQL Generation (Step 2)
+            dialect = self.db_service.db_type
+            yield json.dumps({"type": "status", "content": f"Generating {dialect.upper()} query..."}) + "\n"
+            sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
+            generated_text = await sql_gen_chain.ainvoke({
+                "Question": user_query,
+                "schema_context": schema_context
+            })
+            
+            sql_queries = extract_sql_queries(str(generated_text))
+            if not sql_queries:
+                yield json.dumps({"type": "error", "content": "No SQL queries generated."}) + "\n"
+                return
+
+            yield json.dumps({"type": "sql", "content": sql_queries}) + "\n"
+
+            # 4. SQL Execution (Step 3)
+            yield json.dumps({"type": "status", "content": "Executing SQL and retrieving data..."}) + "\n"
+            results = []
+            for query in sql_queries:
+                query_result = self.db_service.execute_query(query)
+                results.append(query_result)
+            
+            yield json.dumps({"type": "results", "content": results}) + "\n"
+
+            # 5. Explaining Results (Step 4 - The actual Stream)
+            yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
+            explanation_chain = self.llm_service.create_explanation_chain()
+            
+            explanation_input = {
+                "Question": user_query,
+                "schema_info": schema_context,
+                "results": str(results)
+            }
+            
+            yield json.dumps({"type": "explanation_start"}) + "\n"
+            full_explanation = ""
+            async for chunk in explanation_chain.astream(explanation_input):
+                full_explanation += chunk
+                yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
+            
+            # Final metadata
+            execution_time = time.time() - start_time
+            yield json.dumps({
+                "type": "metadata", 
+                "execution_time": execution_time,
+                "timestamp": datetime.now().isoformat()
+            }) + "\n"
+
+        except Exception as e:
+            logging.error(f"Streaming query failed: {e}")
+            yield json.dumps({"type": "error", "content": str(e)}) + "\n"
+
     def _detect_meta_query(self, query: str) -> bool:
         """Detect if the query is asking about the database structure itself (metadata)."""
         meta_keywords = [

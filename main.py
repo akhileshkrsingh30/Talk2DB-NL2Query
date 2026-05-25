@@ -131,8 +131,7 @@ app = FastAPI(
     title=settings.app_title,
     description=settings.app_description,
     version=settings.app_version,
-    lifespan=lifespan,
-    dependencies=[Depends(verify_token)]
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -144,12 +143,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(database.router)
-app.include_router(mongodb.router)
-app.include_router(queries.router)
-app.include_router(sharing.router)
-app.include_router(llm_config.router)
+# Include routers with token verification
+app.include_router(database.router, dependencies=[Depends(verify_token)])
+app.include_router(mongodb.router, dependencies=[Depends(verify_token)])
+app.include_router(queries.router, dependencies=[Depends(verify_token)])
+app.include_router(sharing.router, dependencies=[Depends(verify_token)])
+app.include_router(llm_config.router, dependencies=[Depends(verify_token)])
 
 @app.get("/", include_in_schema=False)
 async def root():

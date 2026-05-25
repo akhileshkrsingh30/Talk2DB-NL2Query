@@ -282,6 +282,67 @@ class MongoDBService:
         
         return "\n".join(lines)
 
+    async def stream_query(self, query_request: Any, llm_service: Any, user_id: str = None):
+        """Process natural language query for MongoDB and stream results"""
+        import time
+        import json
+        start_time = time.time()
+        
+        try:
+            yield json.dumps({"type": "status", "content": "Analyzing collection schema..."}) + "\n"
+            schema_description = self.get_schema_description()
+            
+            # 1. Generate MongoDB Query
+            yield json.dumps({"type": "status", "content": "Generating MongoDB query..."}) + "\n"
+            
+            # Simple token estimation
+            input_tokens = len(query_request.query.split()) + len(schema_description.split())
+            
+            prompt = llm_service.create_mongodb_chain()
+            generated_text = await prompt.ainvoke({
+                "Question": query_request.query,
+                "schema_info": schema_description
+            })
+            
+            # Parse the generated MongoDB query
+            cleaned_text = str(generated_text).strip()
+            import re
+            cleaned_text = re.sub(r'^```(?:json)?\s*', '', cleaned_text)
+            cleaned_text = re.sub(r'\s*```$', '', cleaned_text)
+            query_dict = json.loads(cleaned_text)
+            
+            yield json.dumps({"type": "mongo_query", "content": query_dict}) + "\n"
+
+            # 2. Execute Query
+            yield json.dumps({"type": "status", "content": "Executing MongoDB query..."}) + "\n"
+            results = self.execute_query(query_dict)
+            
+            yield json.dumps({"type": "results", "content": results, "count": len(results)}) + "\n"
+
+            # 3. Stream Explanation
+            yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
+            explanation_chain = llm_service.create_mongodb_explanation_chain()
+            
+            explanation_input = {
+                "Question": query_request.query,
+                "schema_info": schema_description,
+                "results": str(results[:20]) # Limit to avoid token overflow
+            }
+            
+            yield json.dumps({"type": "explanation_start"}) + "\n"
+            async for chunk in explanation_chain.astream(explanation_input):
+                yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
+            
+            execution_time = time.time() - start_time
+            yield json.dumps({
+                "type": "metadata", 
+                "execution_time": execution_time,
+                "timestamp": datetime.now().isoformat()
+            }) + "\n"
+
+        except Exception as e:
+            yield json.dumps({"type": "error", "content": str(e)}) + "\n"
+
     def execute_query(self, query_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Execute a MongoDB query from a parsed query dict"""
         if not self.connected or self.collection is None:

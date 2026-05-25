@@ -21,3 +21,5 @@ neo4j>=5.14.1
 mysql-connector-python>=8.0.33
 aiohttp>=3.13.4
 Pygments>=2.20.0
+pymssql>=2.3.0
+oracledb>=2.0.0
