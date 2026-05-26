@@ -62,88 +62,20 @@ class QueryService:
             host = db_params.get("host", "unknown")
             db_name = db_params.get("database", "unknown")
             
-            logging.info(f"[STEP 1] Using Neo4j graph for schema discovery in DB: '{db_name}'...")
-            
-            # Token tracking
-            input_tokens = self.count_tokens(user_query)
-            output_tokens = 0
-            
-            schema_context = ""
+            # STEP 1: COMPACT SCHEMA RETRIEVAL (DIRECT FROM DB)
             try:
-                if self.neo4j_service and self.neo4j_service.is_connected():
-                    logging.info("[STEP 1] Starting Iterative Graph-Based Discovery...")
-                    
-                    # 1A. Concept Extraction
-                    concept_chain = self.llm_service.create_concept_extraction_chain()
-                    keywords_text = concept_chain.invoke({"Question": user_query})
-                    output_tokens += self.count_tokens(str(keywords_text))
-                    keywords = [k.strip() for k in keywords_text.split(",") if k.strip()]
-                    logging.info(f"[STEP 1] Extracted business concepts: {keywords}")
-                    
-                    # 1B. Anchor Retrieval (Initial Ranking)
-                    anchors = self.neo4j_service.find_relevant_schema(db_name, keywords)
-                    logging.info(f"[STEP 1] Found {len(anchors)} anchor candidates in Neo4j.")
-                    
-                    if anchors:
-                        # 1C. Join Path Expansion (Path Finding between anchors)
-                        anchor_full_names = [a['full_name'] for a in anchors[:8]] # Use top 8 for path finding
-                        bridges = self.neo4j_service.get_path_bridges(db_name, anchor_full_names)
-                        logging.info(f"[STEP 1] Discovered {len(bridges)} bridging tables via FK paths.")
-                        
-                        all_relevant_nodes = anchors + bridges
-                        
-                        # 1D. Target Check & Iteration (Planning Step)
-                        # We use capsules for the planner to keep context small
-                        candidate_context = self._format_schema_capsules(all_relevant_nodes[:30], db_name)
-                        
-                        planner_chain = self.llm_service.create_schema_planner_chain()
-                        plan_resp = planner_chain.invoke({
-                            "Question": user_query,
-                            "schema_context": candidate_context
-                        })
-                        
-                        try:
-                            plan = json.loads(plan_resp)
-                            if plan.get("status") == "need_more_schema":
-                                logging.info(f"[STEP 1] Planner detected missing concepts: {plan['missing_concepts']}. Expanding...")
-                                extra_terms = plan.get("next_search_terms", [])
-                                extra_nodes = self.neo4j_service.find_relevant_schema(db_name, extra_terms)
-                                all_relevant_nodes.extend(extra_nodes)
-                        except:
-                            logging.warning("[STEP 1] Planner returned invalid JSON. Proceeding with current nodes.")
-                        
-                        # Formatting Final Capsules
-                        schema_context = self._format_schema_capsules(all_relevant_nodes[:40], db_name)
-                        logging.info(f"[STEP 1] Final iterative discovery yielded {len(all_relevant_nodes)} tables.")
-                    else:
-                        logging.info("[STEP 1] Neo4j search returned 0 matches for keywords.")
-                else:
-                    logging.warning("⚠️ [STEP 1] Neo4j service is NOT connected. Skipping graph search.")
+                logging.info(f"[STEP 1] Fetching compact schema for '{db_name}'...")
                 
-                # Fallback to MongoDB if Neo4j failed or returned nothing
-                if not schema_context and self.mongodb_service:
-                    logging.info(f"[STEP 1] Falling back to MongoDB for DB: '{db_name}'...")
-                    search_chain = self.llm_service.create_table_search_mongodb_chain()
-                    mongo_filter_text = search_chain.invoke({"Question": user_query})
-                    
-                    clean_filter = mongo_filter_text.strip()
-                    if clean_filter.startswith("```"):
-                       if "json" in clean_filter:
-                           clean_filter = clean_filter.split("json", 1)[1].rsplit("```", 1)[0].strip()
-                       else:
-                           clean_filter = clean_filter.split("```", 1)[1].rsplit("```", 1)[0].strip()
-                    
-                    filter_json = json.loads(clean_filter)
-                    relevant_table_docs = self.mongodb_service.query_table_metadata(host, db_name, filter_json)
-                    
-                    if relevant_table_docs:
-                        schema_context = f"Relevant Tables for database '{db_name}' (discovered via MongoDB):\n"
-                        for doc in relevant_table_docs[:15]:
-                            schema_name = doc.get("schema", "public")
-                            cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in doc.get("columns", [])])
-                            schema_context += f"- Table: {schema_name}.{doc['table']} (Columns: {cols_desc})\n"
-
-                # Final fallback to simplified full schema
+                # Simple retrieval directly from the DB metadata
+                schema_context = self.db_service.get_simplified_schema()
+                
+                # Additional truncation for speed if needed
+                if len(schema_context) > 30000:
+                    schema_context = schema_context[:30000] + "\n[...schema truncated for speed...]"
+                
+                logging.info(f"[STEP 1] Compact schema ready ({len(schema_context)} chars).")
+                
+                # Final fallback to simplified full schema if discovery somehow returned empty
                 if not schema_context:
                     if is_meta_query:
                         logging.info("[STEP 1] Injecting metadata schema context (information_schema)...")
@@ -154,17 +86,7 @@ class QueryService:
             
             except Exception as discovery_err:
                 err_str = str(discovery_err)
-                if "404" in err_str and ("not found" in err_str.lower() or "model" in err_str.lower()):
-                    c = self.llm_service.config_details
-                    if c and c.get("model") != settings.llm_model_name:
-                        logging.warning(f"⚠️ Auto-reverting model to default '{settings.llm_model_name}' due to 404.")
-                        self.llm_service.configure(c.get("api_key"), c.get("base_url"), settings.llm_model_name, c.get("headers"), False)
-                        raise RuntimeError(f"Self-healed LLM Config to '{settings.llm_model_name}'. Please re-run your query.")
-
-                if any(x in err_str for x in ["Connection error", "Connection refused", "unreachable", "10061"]):
-                    logging.warning(f"⚠️ [STEP 1] LLM Service unreachable during discovery: {err_str}. Discovery skipped.")
-                else:
-                    logging.error(f"[ERROR] Schema discovery failed: {err_str}. Falling back to full schema.")
+                logging.error(f"[ERROR] Schema discovery failed: {err_str}. Falling back to full schema.")
                 schema_context = self.db_service.get_simplified_schema()
             
             # Final safety truncation (based on configured context window)
@@ -173,71 +95,21 @@ class QueryService:
                 schema_context = schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated for size...]"
             logging.info(f"--- FINAL SCHEMA CONTEXT SENT TO LLM ---\n{schema_context}\n----------------------------------------")
             
-            # 2. GENERATE SQL (LLM CALL 2)
-            logging.info(f"[STEP 2] Generating PostgreSQL SQL for DB: '{db_name}'...")
+            # 2. GENERATE SQL (LLM CALL 1 - COMBINED)
+            logging.info(f"[STEP 2] Generating SQL directly...")
             sql_gen_chain = self.llm_service.create_sql_generation_chain()
             
-            # Update tokens for Step 2
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+            input_tokens = self.count_tokens(user_query) + self.count_tokens(schema_context)
             
-            try:
-                generated_text = sql_gen_chain.invoke({
-                    "Question": user_query,
-                    "schema_context": schema_context
-                })
-                logging.info(f"[STEP 2] Successfully generated AI SQL for '{db_name}'.")
-            except Exception as sql_err:
-                err_str = str(sql_err)
-                logging.error(f"[ERROR] SQL generation failed: {err_str}")
-                configured_model = self.llm_service.config_details.get("model", "unknown") if self.llm_service.config_details else "unknown"
-                llm_base = self.llm_service.config_details.get("base_url", "the configured LLM server") if self.llm_service.config_details else "the configured LLM server"
-                # Detect LLM server unreachable
-                if any(x in err_str for x in ["Connection error", "Connection refused", "10061", "NewConnectionError"]):
-                    raise RuntimeError(
-                        f"LLM server is unreachable at '{llm_base}'. "
-                        f"Check if the service is running or if there's a network/proxy issue."
-                    )
-                # Detect model not found (404)
-                if "404" in err_str and ("not found" in err_str.lower() or "model" in err_str.lower()):
-                    c = self.llm_service.config_details
-                    if c and c.get("model") != settings.llm_model_name:
-                        logging.warning(f"⚠️ Auto-reverting model to default '{settings.llm_model_name}' due to 404.")
-                        self.llm_service.configure(c.get("api_key"), c.get("base_url"), settings.llm_model_name, c.get("headers"), False)
-                        raise RuntimeError(f"Self-healed LLM Config to '{settings.llm_model_name}'. Please re-run your query.")
-                    raise RuntimeError(
-                        f"Model '{configured_model}' not found on '{llm_base}'. "
-                        f"Please re-configure with a valid model name."
-                    )
-                raise RuntimeError(f"SQL Generation failed: {err_str}")
-            
-            # Count output tokens for SQL generation
-            output_tokens += self.count_tokens(str(generated_text))
-            
-            # Extract SQL queries
+            generated_text = sql_gen_chain.invoke({
+                "Question": user_query,
+                "schema_context": schema_context
+            })
+            output_tokens = self.count_tokens(str(generated_text))
             sql_queries = extract_sql_queries(str(generated_text))
             
-            # Check for insufficient schema fallback
-            is_insufficient = False
-            if sql_queries and len(sql_queries) > 0:
-                if "insufficient schema context" in sql_queries[0].lower():
-                    is_insufficient = True
-                    
-            if is_insufficient:
-                logging.warning("[STEP 2] LLM reported insufficient schema context. Falling back to full PostgreSQL database schema...")
-                full_schema_context = self.db_service.get_simplified_schema()
-                
-                if len(full_schema_context) > settings.llm_max_context_chars:
-                    full_schema_context = full_schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated for size...]"
-                
-                logging.info("[STEP 2] Re-generating SQL with full fallback schema...")
-                input_tokens += self.count_tokens(full_schema_context)
-                
-                generated_text = sql_gen_chain.invoke({
-                    "Question": user_query,
-                    "schema_context": full_schema_context
-                })
-                output_tokens += self.count_tokens(str(generated_text))
-                sql_queries = extract_sql_queries(str(generated_text))
+            # No secondary fallback if first one has context
+
             
             if not sql_queries:
                 raise ValueError(f"No SQL queries generated for '{db_name}' from the LLM response.")
@@ -317,14 +189,16 @@ class QueryService:
             # Store in history
             self.query_history.append(response)
             
-            # Persist to MongoDB if available
+            # 5. PERSISTENCE (Save to MongoDB for history and sharing)
             if self.mongodb_service:
                 try:
                     mongo_id = self.mongodb_service.save_result(response)
-                    response["mongodb_id"] = mongo_id
-                    logging.info(f"[INFO] Result saved to MongoDB with ID: {mongo_id}")
-                except Exception as e:
-                    logging.error(f"[ERROR] Failed to save to MongoDB: {e}")
+                    if mongo_id:
+                        response["mongodb_id"] = mongo_id
+                        logging.info(f"[OK] Response result saved to MongoDB (ID: {mongo_id})")
+                except Exception as mongo_err:
+                    logging.error(f"[ERROR] Failed to save result to MongoDB: {mongo_err}")
+
             
             logging.info(f"[INFO] Query processed successfully in {execution_time:.2f}s | Tokens: In={input_tokens}, Out={output_tokens}")
             return response

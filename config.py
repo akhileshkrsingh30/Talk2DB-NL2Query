@@ -11,7 +11,7 @@ print(f"Loading .env from: {env_path} (exists: {os.path.exists(env_path)})")
 
 class Settings(BaseSettings):
     model_config = ConfigDict(
-        env_file=".env",
+        env_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         protected_namespaces=('settings_',),
@@ -29,8 +29,8 @@ class Settings(BaseSettings):
     # LLM configuration
     krutim_cloud_api_key: str = Field("", env="KRUTIM_CLOUD_API_KEY")
     openai_api_key: str = Field("", env="OPENAI_API_KEY")
-    openai_api_base: str = Field("", env="OPENAI_API_BASE")
-    llm_model_name: str = Field("gpt-5.2", env="LLM_MODEL_NAME")
+    openai_api_base: str = Field("https://api.openai.com/v1", env="OPENAI_API_BASE")
+    llm_model_name: str = Field("gpt-5-mini", env="LLM_MODEL_NAME")
     llm_max_context_chars: int = Field(100000, env="LLM_MAX_CONTEXT_CHARS")
     llm_max_output_tokens: int = Field(4096, env="LLM_MAX_OUTPUT_TOKENS")
     
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     mongo_db_name: str = Field("ValoDSS", env="MONGO_DB_NAME")
     
     # Neo4j configuration
-    neo4j_uri: str = Field("bolt://localhost:7687", env="NEO4J_URI")
+    neo4j_uri: str = Field("bolt://127.0.0.1:7687", env="NEO4J_URI")
     neo4j_user: str = Field("neo4j", env="NEO4J_USER")
     neo4j_password: str = Field("password", env="NEO4J_PASSWORD")
     

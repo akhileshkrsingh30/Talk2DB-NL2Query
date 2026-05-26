@@ -13,7 +13,7 @@ class LLMService:
         self.config_details: Optional[Dict[str, Any]] = None
         self.last_error: Optional[str] = None
         
-    def test_api_key(self, api_key: str, base_url: str, model: str = "gpt-3.5-turbo", headers: Optional[Dict[str, str]] = None) -> bool:
+    def test_api_key(self, api_key: str, base_url: str, model: str = "gpt-5-mini", headers: Optional[Dict[str, str]] = None) -> bool:
         """Test if the API key is valid by making a simple request"""
         try:
             self.last_error = None
@@ -117,7 +117,7 @@ class LLMService:
                 openai_api_key=api_key,
                 model=model,
                 temperature=1.0 if "nemotron" in model.lower() else 0.0,
-                max_tokens=16384 if "nemotron" in model.lower() else settings.llm_max_output_tokens,
+                max_tokens=16384 if "nemotron" in model.lower() else min(settings.llm_max_output_tokens, 16384),
                 top_p=0.95 if "nemotron" in model.lower() else 1.0,
                 timeout=120,
                 default_headers=headers,
@@ -158,7 +158,7 @@ class LLMService:
                 self.configure(
                     api_key=api_key,
                     base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE"),
-                    model=settings.llm_model_name or os.getenv("LLM_MODEL_NAME") or "gpt-5.2",
+                    model=settings.llm_model_name or os.getenv("LLM_MODEL_NAME") or "gpt-5-mini",
                     validate_key=False
                 )
             except Exception as e:
@@ -195,19 +195,20 @@ class LLMService:
             
         prompt = ChatPromptTemplate.from_template(
             """You are a PostgreSQL expert. Generate syntactically correct SQL for the following question.
-            Return only SQL. Use this database schema:
+            Use this database schema:
             {schema_info}
 
             Question: {Question}
 
             CRITICAL RULES:
+            - WRAP YOUR SQL QUERY IN A MARKDOWN BLOCK (e.g., ```sql \n SELECT ... \n ```)
+            - DO NOT provide any natural language explanation or conversational filler
             - Use ONLY the exact column names provided in the schema above
             - Do NOT use generic column names like "date"; verify the exact column name from the schema
             - Double-check that every referenced column exists in the schema
             - Use modular CTEs (WITH clauses) for complex logic involving more than 3 tables
             - For date/timestamp columns, verify the exact column name from the schema (e.g., order_date, created_at)
             - Check join connectivity before generating; do not assume join paths if keys are not visible in the capsules
-            - Return only the SQL query, no explanations or markdown
             """
         )
         return prompt | self.llm | StrOutputParser()
@@ -218,7 +219,7 @@ class LLMService:
             raise RuntimeError("LLM not configured. Cannot create explanation chain.")
             
         return ChatPromptTemplate.from_template(
-            """You are a helpful data assistant. Given a user's question, the database schema, and the results of a SQL query, provide a clear and concise natural language explanation of the results.
+            """You are a helpful data assistant. Given a user's question, the database schema, and the results of a SQL query, provide a clear, comprehensive, and well-formatted natural language explanation of the results.
 
             User's Question: {Question}
             Database Schema: {schema_info}
@@ -227,9 +228,9 @@ class LLMService:
             CRITICAL GROUNDING RULES:
             1. ONLY answer based on the provided "Query Results". 
             2. If the results say "Insufficient schema context", inform the user that the specific data requested was not found.
-            3. NEVER invent numbers (e.g., do not say 'There are 50 tables' if the results don't specifically contain that number).
-            4. If the results are empty, state that no information was found for that specific question.
-            5. Use plain text only. NO Markdown. NO asterisks (**), NO bolding, NO backticks.
+            3. NEVER invent numbers or data.
+            4. If the results contain a long list of items (e.g. names, records), present the ENTIRE list clearly using bullet points, numbered lists, or markdown tables. Do NOT condense them into a messy paragraph.
+            5. Provide a full and descriptive response using rich markdown formatting (bolding, lists, code blocks, etc.) to make it highly readable.
             """
         ) | self.llm | StrOutputParser()
 
@@ -337,13 +338,13 @@ AVAILABLE SCHEMA (you may ONLY use these tables and columns):
 User's Question: {Question}
 
 ABSOLUTE RULES - Violations will cause runtime errors:
-1. DO NOT use ANY table not explicitly listed in the schema above.
-2. DO NOT invent or guess column names. Use ONLY the exact column names shown above.
-3. DO NOT reference any table from your training data or general knowledge.
-4. Make your best effort to construct the query using the available schema context, even if some column names require an educated guess. Only return SELECT 'Insufficient schema context to answer this question' AS message; if the provided tables are completely irrelevant to the question.
-5. Return ONLY the raw SQL statement. No markdown, no ```, no explanation.
+1. WRAP YOUR SQL QUERY IN A MARKDOWN BLOCK (e.g., ```sql \n SELECT ... \n ```).
+2. DO NOT provide any natural language explanation, conversational filler, or preamble. 
+3. DO NOT use ANY table not explicitly listed in the schema above.
+4. DO NOT invent or guess column names. Use ONLY the exact column names shown above.
+5. If the provided schema is completely irrelevant, return only: ```sql \n SELECT 'Insufficient schema context to answer this question' AS message; \n ```
 6. Use correct PostgreSQL syntax with schema prefix where needed (e.g., hr.employees).
-7. Always add a LIMIT clause (default LIMIT 100) unless the question requires a full count.
+7. Do NOT add a LIMIT clause unless the user explicitly asks for a specific number of records.
 
 SQL Query:"""
         )
@@ -379,7 +380,7 @@ SQL Query:"""
             - ENSURE the JSON is complete and valid.
 
             Example output:
-            {{"filter": {{"age": {{"$gt": 25}}}}, "projection": {{"name": 1, "age": 1, "_id": 0}}, "sort": {{"age": -1}}, "limit": 10}}
+            {{"filter": {{"age": {{"$gt": 25}}}}, "projection": {{"name": 1, "age": 1, "_id": 0}}, "sort": {{"age": -1}}}}
             """
         )
         return prompt | self.llm | StrOutputParser()
