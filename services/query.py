@@ -1,24 +1,25 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import time
 from datetime import datetime
 
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.billing.billing_service import BillingService
-from services.neo4j_service import Neo4jService
 from utils.parsing import extract_sql_queries
 import tiktoken
 import json
 import logging
+import re
 from config import settings
 
+
 class QueryService:
-    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None, neo4j_service = None):
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None, mem0_service = None):
         self.db_service = db_service
         self.llm_service = llm_service
         self.billing_service = billing_service
         self.mongodb_service = mongodb_service
-        self.neo4j_service = neo4j_service
+        self.mem0_service = mem0_service
         self.query_history = []
         try:
             self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -43,227 +44,287 @@ class QueryService:
                 error_msg += f" Current config state: {config_details}"
             raise ValueError(error_msg)
         
-    def process_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
-                      user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None) -> Dict[str, Any]:
-        """Process natural language query and return results (Enhanced 2-step approach)"""
+    def process_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
+                      user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
+                      background_tasks: Any = None, task_id: int = None) -> Dict[str, Any]:
+        """Process natural language query and return results.
+        Flow: fetch Mem0 RBAC -> schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
+        """
         start_time = time.time()
-        
+
         try:
-            # Validate prerequisites first
             self.validate_prerequisites()
-            
-            logging.info(f"--- START PROCESSING QUERY: '{user_query[:50]}...' ---")
-            
-            # Detect if this is a meta-query about the database structure itself
-            is_meta_query = self._detect_meta_query(user_query)
-            
-            # 1. FETCH RELEVANT TABLES FROM NEO4J (LLM CALL 1)
+
+            logging.info(f"--- START PROCESSING QUERY: '{user_query[:80]}' ---")
+
+            # Fetch Mem0 Permissions
+            permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
+            if self.mem0_service:
+                if user_id:
+                    permissions = self.mem0_service.get_user_permissions(user_id)
+                    logging.info(f"[RBAC] Active permissions from Mem0: {permissions}")
+                
+                # Fetch task mapping if task_id is provided
+                if task_id:
+                    try:
+                        memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
+                        task_tables = None
+                        for m in memories:
+                            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+                            if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                                raw_tables = meta.get("tables", "[]")
+                                try:
+                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
+                                except Exception:
+                                    task_tables = []
+                                break
+                        
+                        if task_tables is not None:
+                            logging.info(f"[Task Security] Enforcing task {task_id} allowed tables: {task_tables}")
+                            # Override allowed_tables to restrict to the task's allowed tables
+                            if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
+                                u_allowed = {t.lower() for t in permissions["allowed_tables"]}
+                                t_allowed = {t.lower() for t in task_tables}
+                                permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
+                            else:
+                                permissions["allowed_tables"] = task_tables
+                            print(f"[Mem0 Tables] task_id: {task_id} | Allowed tables sent to LLM: {permissions['allowed_tables']}")
+                        else:
+                            logging.warning(f"[Task Security] Task {task_id} not found in Mem0. Access defaults to all tables.")
+                            permissions["allowed_tables"] = ["*"]
+                            print(f"[Mem0 Tables] task_id: {task_id} not found in Mem0 | Defaults sent to LLM: {permissions['allowed_tables']}")
+                    except Exception as task_err:
+                        logging.error(f"[Task Security] Failed to lookup task {task_id}: {task_err}")
+                else:
+                    # if no task_id then allowed all the table by default
+                    permissions["allowed_tables"] = ["*"]
+                    permissions["restricted_tables"] = []
+
             db_params = self.db_service.get_connection_params()
-            host = db_params.get("host", "unknown")
             db_name = db_params.get("database", "unknown")
-            
-            logging.info(f"[STEP 1] Using Neo4j graph for schema discovery in DB: '{db_name}'...")
-            
-            # Token tracking
+            dialect = self.db_service.db_type
+
+            # ── STEP 1: Fetch schema ────────────────────────────────────────────
+            logging.info("[STEP 1] Fetching database schema...")
             input_tokens = self.count_tokens(user_query)
             output_tokens = 0
-            
+
             schema_context = ""
             try:
-                if self.neo4j_service and self.neo4j_service.is_connected():
-                    logging.info("[STEP 1] Starting Iterative Graph-Based Discovery...")
-                    
-                    # 1A. Concept Extraction
-                    concept_chain = self.llm_service.create_concept_extraction_chain()
-                    keywords_text = concept_chain.invoke({"Question": user_query})
-                    output_tokens += self.count_tokens(str(keywords_text))
-                    keywords = [k.strip() for k in keywords_text.split(",") if k.strip()]
-                    logging.info(f"[STEP 1] Extracted business concepts: {keywords}")
-                    
-                    # 1B. Anchor Retrieval (Initial Ranking)
-                    anchors = self.neo4j_service.find_relevant_schema(db_name, keywords)
-                    logging.info(f"[STEP 1] Found {len(anchors)} anchor candidates in Neo4j.")
-                    
-                    if anchors:
-                        # 1C. Join Path Expansion (Path Finding between anchors)
-                        anchor_full_names = [a['full_name'] for a in anchors[:8]] # Use top 8 for path finding
-                        bridges = self.neo4j_service.get_path_bridges(db_name, anchor_full_names)
-                        logging.info(f"[STEP 1] Discovered {len(bridges)} bridging tables via FK paths.")
-                        
-                        all_relevant_nodes = anchors + bridges
-                        
-                        # 1D. Target Check & Iteration (Planning Step)
-                        # We use capsules for the planner to keep context small
-                        candidate_context = self._format_schema_capsules(all_relevant_nodes[:30], db_name)
-                        
-                        planner_chain = self.llm_service.create_schema_planner_chain()
-                        plan_resp = planner_chain.invoke({
-                            "Question": user_query,
-                            "schema_context": candidate_context
-                        })
-                        
-                        try:
-                            plan = json.loads(plan_resp)
-                            if plan.get("status") == "need_more_schema":
-                                logging.info(f"[STEP 1] Planner detected missing concepts: {plan['missing_concepts']}. Expanding...")
-                                extra_terms = plan.get("next_search_terms", [])
-                                extra_nodes = self.neo4j_service.find_relevant_schema(db_name, extra_terms)
-                                all_relevant_nodes.extend(extra_nodes)
-                        except:
-                            logging.warning("[STEP 1] Planner returned invalid JSON. Proceeding with current nodes.")
-                        
-                        # Formatting Final Capsules
-                        schema_context = self._format_schema_capsules(all_relevant_nodes[:40], db_name)
-                        logging.info(f"[STEP 1] Final iterative discovery yielded {len(all_relevant_nodes)} tables.")
+                allowed_tables = permissions.get("allowed_tables")
+                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+                if schema_context:
+                    if allowed_tables is not None and allowed_tables != ["*"]:
+                        logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars) filtered by task allowed tables: {allowed_tables}")
                     else:
-                        logging.info("[STEP 1] Neo4j search returned 0 matches for keywords.")
+                        logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars). Bypassing schema filtering to send full schema to LLM.")
                 else:
-                    logging.warning("⚠️ [STEP 1] Neo4j service is NOT connected. Skipping graph search.")
-                
-                # Fallback to PostgreSQL if Neo4j discovery yielded no results
-                if not schema_context:
-                    logging.warning("⚠️ [STEP 1] Neo4j returned no schema context. Falling back to PostgreSQL simplified schema...")
-                    schema_context = self.db_service.get_simplified_schema()
-                    if schema_context:
-                        logging.info("[STEP 1] Successfully retrieved simplified schema from PostgreSQL.")
-                    else:
-                        logging.error("[STEP 1] PostgreSQL simplified schema is also empty.")
-            
-            except Exception as discovery_err:
-                err_str = str(discovery_err)
-                if "404" in err_str and ("not found" in err_str.lower() or "model" in err_str.lower()):
-                    c = self.llm_service.config_details
-                    if c and c.get("model") != settings.llm_model_name:
-                        logging.warning(f"⚠️ Auto-reverting model to default '{settings.llm_model_name}' due to 404.")
-                        self.llm_service.configure(c.get("api_key"), c.get("base_url"), settings.llm_model_name, c.get("headers"), False)
-                        raise RuntimeError(f"Self-healed LLM Config to '{settings.llm_model_name}'. Please re-run your query.")
+                    logging.error("[STEP 1] Schema is empty — cannot generate SQL.")
+            except Exception as schema_err:
+                logging.error(f"[STEP 1] Schema fetch failed: {schema_err}")
 
-                if any(x in err_str for x in ["Connection error", "Connection refused", "unreachable", "10061"]):
-                    logging.warning(f"⚠️ [STEP 1] LLM Service unreachable during discovery: {err_str}. Discovery skipped.")
-                else:
-                    logging.error(f"[ERROR] Schema discovery failed: {err_str}.")
-                
-                # Fallback to PostgreSQL simplified schema on any discovery error
-                logging.warning("⚠️ [STEP 1] Falling back to PostgreSQL simplified schema due to discovery error...")
-                try:
-                    schema_context = self.db_service.get_simplified_schema()
-                except Exception as pg_err:
-                    logging.error(f"[ERROR] PostgreSQL fallback also failed: {pg_err}")
-            
-            # Final safety truncation (based on configured context window)
+            if task_id:
+                schema_context = f"these are the table task_id {task_id} is allowed\nthese are the table task_id{task_id} is allowed\n\n" + schema_context
+
+            # Truncate if oversized
             if len(schema_context) > settings.llm_max_context_chars:
-                logging.info(f"[STEP 1] Truncating schema context from {len(schema_context)} characters to {settings.llm_max_context_chars}...")
-                schema_context = schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated for size...]"
-            logging.info(f"--- FINAL SCHEMA CONTEXT SENT TO LLM ---\n{schema_context}\n----------------------------------------")
-            
-            # 2. GENERATE SQL (LLM CALL 2)
-            dialect = self.db_service.db_type
-            logging.info(f"[STEP 2] Generating {dialect.upper()} SQL for DB: '{db_name}'...")
+                logging.info(f"[STEP 1] Truncating schema from {len(schema_context)} → {settings.llm_max_context_chars} chars.")
+                schema_context = schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated...]"
+
+            logging.info(f"[STEP 1] Schema sent to LLM:\n{schema_context}\n{'─'*60}")
+
+            # ── Meta-query injection ────────────────────────────────────────────
+            # If the user is asking about DB structure, prepend information_schema hints
+            if self._detect_meta_query(user_query):
+                meta_context = self._get_meta_context(db_name, dialect)
+                schema_context = meta_context + "\n\n" + schema_context
+                logging.info("[STEP 1] Meta-query detected — injected information_schema context.")
+
+            # ── STEP 2: Generate SQL ────────────────────────────────────────────
+            logging.info(f"[STEP 2] Generating {dialect.upper()} SQL...")
             sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
-            
-            # Update tokens for Step 2
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
-            
+
+            # Inject Row-level Filter constraints from Mem0
+            augmented_query = user_query
+            if permissions.get("role") != "admin" and permissions.get("row_filters"):
+                filter_str = " AND ".join(permissions["row_filters"])
+                augmented_query += f"\n(CONSTRAINT: Ensure the generated SQL only returns records satisfying: {filter_str})"
+
+            if task_id and permissions.get("allowed_tables") and permissions["allowed_tables"] != ["*"]:
+                allowed_tables_str = ", ".join(permissions["allowed_tables"])
+                allowed_list_quoted = ", ".join(f"'{t}'" for t in permissions["allowed_tables"])
+                augmented_query += (
+                    f"\n(STRICT CONSTRAINT: You MUST only use and query the following allowed tables for task {task_id}: {allowed_tables_str}. "
+                    f"Do NOT generate SQL querying any other tables, even if they are listed in system metadata or elsewhere. "
+                    f"If you are querying system catalogs/metadata views (like information_schema.tables or information_schema.columns), "
+                    f"you MUST append a WHERE filter on the table name column (e.g., table_name IN ({allowed_list_quoted})) "
+                    f"so that ONLY the allowed tables are returned in the query results. "
+                    f"Never expose or query any other tables under any circumstances.)"
+                )
+
+            input_tokens += self.count_tokens(augmented_query) + self.count_tokens(schema_context)
+
             try:
                 generated_text = sql_gen_chain.invoke({
-                    "Question": user_query,
+                    "Question": augmented_query,
                     "schema_context": schema_context
                 })
-                logging.info(f"[STEP 2] Successfully generated AI SQL for '{db_name}'.")
+                output_tokens += self.count_tokens(str(generated_text))
+                raw_output = str(generated_text).strip()
+                logging.info(f"[STEP 2] LLM raw output ({len(raw_output)} chars):\n{raw_output}\n{'─'*60}")
+                if not raw_output:
+                    raise RuntimeError(
+                        f"The LLM ({self.llm_service.config_details.get('model', 'unknown') if self.llm_service.config_details else 'unknown'}) "
+                        f"returned an empty response. This may happen with reasoning/thinking models. "
+                        f"Try a different model or simplify the question."
+                    )
+                generated_text = raw_output
             except Exception as sql_err:
                 err_str = str(sql_err)
-                logging.error(f"[ERROR] SQL generation failed: {err_str}")
-                configured_model = self.llm_service.config_details.get("model", "unknown") if self.llm_service.config_details else "unknown"
-                llm_base = self.llm_service.config_details.get("base_url", "the configured LLM server") if self.llm_service.config_details else "the configured LLM server"
-                # Detect LLM server unreachable
+                logging.error(f"[STEP 2] SQL generation failed: {err_str}")
+                cfg = self.llm_service.config_details or {}
+                llm_base = cfg.get("base_url", "the configured LLM server")
+                configured_model = cfg.get("model", "unknown")
                 if any(x in err_str for x in ["Connection error", "Connection refused", "10061", "NewConnectionError"]):
-                    raise RuntimeError(
-                        f"LLM server is unreachable at '{llm_base}'. "
-                        f"Check if the service is running or if there's a network/proxy issue."
-                    )
-                # Detect model not found (404)
+                    raise RuntimeError(f"LLM server unreachable at '{llm_base}'. Check if the service is running.")
                 if "404" in err_str and ("not found" in err_str.lower() or "model" in err_str.lower()):
                     c = self.llm_service.config_details
                     if c and c.get("model") != settings.llm_model_name:
-                        logging.warning(f"⚠️ Auto-reverting model to default '{settings.llm_model_name}' due to 404.")
+                        logging.warning(f"⚠️ Auto-reverting model to '{settings.llm_model_name}' due to 404.")
                         self.llm_service.configure(c.get("api_key"), c.get("base_url"), settings.llm_model_name, c.get("headers"), False)
-                        raise RuntimeError(f"Self-healed LLM Config to '{settings.llm_model_name}'. Please re-run your query.")
-                    raise RuntimeError(
-                        f"Model '{configured_model}' not found on '{llm_base}'. "
-                        f"Please re-configure with a valid model name."
-                    )
-                raise RuntimeError(f"SQL Generation failed: {err_str}")
-            
-            # Count output tokens for SQL generation
-            output_tokens += self.count_tokens(str(generated_text))
-            
-            # Extract SQL queries
+                        raise RuntimeError(f"Self-healed LLM config to '{settings.llm_model_name}'. Please re-run your query.")
+                    raise RuntimeError(f"Model '{configured_model}' not found on '{llm_base}'. Please re-configure.")
+                raise RuntimeError(f"SQL generation failed: {err_str}")
+
             sql_queries = extract_sql_queries(str(generated_text))
-            
-            # Removed insufficient schema fallback to PostgreSQL.
-            # If the LLM generates 'Insufficient schema context', it will be executed and return a message to the user.
-            
             if not sql_queries:
-                raise ValueError(f"No SQL queries generated for '{db_name}' from the LLM response.")
-            
-            print(f"[OK] Extracted {len(sql_queries)} SQL queries")
-            
+                raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
+
+            logging.info(f"[STEP 2] Extracted {len(sql_queries)} SQL queries.")
+
+            # Post-Generation Guardrail: block SQL referencing tables outside allowed list
+            allowed_tables = permissions.get("allowed_tables", ["*"])
+            try:
+                db_tables = self.db_service.get_tables()
+            except Exception:
+                db_tables = []
+
+            if allowed_tables is not None and allowed_tables != ["*"]:
+                allowed_lower = {t.lower() for t in allowed_tables}
+                for sql in sql_queries:
+                    for table in db_tables:
+                        if table.lower() not in allowed_lower:
+                            if re.search(rf"\b{re.escape(table)}\b", sql, re.IGNORECASE):
+                                error_msg_rbac = f"Access Denied: You do not have permission to query table."
+                                logging.warning(f"[RBAC] BLOCKED user={user_id} | table='{table}' | sql={sql[:80]}")
+                                if self.mem0_service:
+                                    self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                                raise ValueError(error_msg_rbac)
+            elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
+                for sql in sql_queries:
+                    for restricted_table in permissions["restricted_tables"]:
+                        if re.search(rf"\b{restricted_table}\b", sql, re.IGNORECASE):
+                            error_msg_rbac = f"Access Denied: Query attempts to read restricted table ."
+                            logging.warning(f"[RBAC] User {user_id} blocked: restricted table '{restricted_table}'.")
+                            if self.mem0_service:
+                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                            raise ValueError(error_msg_rbac)
+
+            # ── STEP 3: Execute SQL (with one auto-repair retry) ────────────────
             logging.info(f"[STEP 3] Executing {len(sql_queries)} queries against '{db_name}'...")
-            
-            # Execute queries and collect results
             results = []
-            for i, query in enumerate(sql_queries):
-                logging.info(f"   -> EXECUTING Q{i+1}: {query[:80]}...")
-                query_result = self.db_service.execute_query(query)
-                
-                # Ensure the result is properly formatted
-                if isinstance(query_result, list):
-                    # Already converted to list of dicts in database service
-                    formatted_result = query_result
-                elif isinstance(query_result, dict):
-                    # Command result (INSERT, UPDATE, DELETE, etc.)
-                    formatted_result = query_result
+            final_sql_queries = list(sql_queries)  # may be replaced by repaired versions
+
+            for i, query in enumerate(final_sql_queries):
+                logging.info(f"   → Q{i+1}: {query[:120]}")
+                try:
+                    query_result = self.db_service.execute_query(query)
+                except Exception as exec_err:
+                    error_msg = str(exec_err)
+                    logging.warning(f"[STEP 3] Q{i+1} failed: {error_msg}. Attempting auto-repair...")
+
+                    try:
+                        repair_chain = self.llm_service.create_sql_repair_chain(dialect=dialect)
+                        repaired_sql = repair_chain.invoke({
+                            "Question": augmented_query,
+                            "schema_context": schema_context,
+                            "failed_sql": query,
+                            "error_message": error_msg
+                        })
+                        output_tokens += self.count_tokens(str(repaired_sql))
+                        repaired_queries = extract_sql_queries(str(repaired_sql))
+                        if repaired_queries:
+                            repaired_query = repaired_queries[0]
+                            logging.info(f"[STEP 3] Repaired SQL:\n{repaired_query}")
+                            
+                            # Post-Generation Guardrail Check on Repaired SQL output
+                            allowed_tables = permissions.get("allowed_tables", ["*"])
+                            if allowed_tables is not None and allowed_tables != ["*"]:
+                                allowed_lower = {t.lower() for t in allowed_tables}
+                                for table in db_tables:
+                                    if table.lower() not in allowed_lower:
+                                        if re.search(rf"\b{re.escape(table)}\b", repaired_query, re.IGNORECASE):
+                                            error_msg_rbac = f"Access Denied: You do not have permission to query table."
+                                            logging.warning(f"[RBAC] BLOCKED user={user_id} | table='{table}' | sql={repaired_query[:80]}")
+                                            if self.mem0_service:
+                                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                                            raise ValueError(error_msg_rbac)
+
+                            if permissions.get("role") != "admin" and permissions.get("restricted_tables"):
+                                for restricted_table in permissions["restricted_tables"]:
+                                    if re.search(rf"\b{restricted_table}\b", repaired_query, re.IGNORECASE):
+                                        error_msg_rbac = f"Access Denied: Repaired query attempts to read restricted table ."
+                                        logging.warning(f"[RBAC] User {user_id} blocked: repaired query tried to access restricted table '{restricted_table}'. SQL: {repaired_query}")
+                                        if self.mem0_service:
+                                            self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                                        raise ValueError(error_msg_rbac)
+                                        
+                            query_result = self.db_service.execute_query(repaired_query)
+                            final_sql_queries[i] = repaired_query  # record the repaired version
+                            logging.info(f"[STEP 3] Repaired query executed successfully.")
+                        else:
+                            raise RuntimeError("Repair chain returned no valid SQL.")
+                    except Exception as repair_err:
+                        logging.error(f"[STEP 3] Auto-repair also failed: {repair_err}")
+                        raise RuntimeError(
+                            f"Query execution failed and could not be auto-repaired.\n"
+                            f"Original error: {error_msg}\nRepair error: {repair_err}"
+                        )
+
+                # Normalise result format
+                query_result = self._filter_metadata_results(query_result, allowed_tables)
+                if isinstance(query_result, (list, dict)):
+                    results.append(query_result)
                 else:
-                    # Fallback for unexpected types
-                    formatted_result = {"raw_result": str(query_result)}
-                
-                results.append(formatted_result)
-            
-            logging.info("[OK] [STEP 3] Successfully executed all queries.")
-            
-            # 4. EXPLAIN RESULTS (LLM CALL 3)
+                    results.append({"raw_result": str(query_result)})
+
+            logging.info("[STEP 3] All queries executed successfully.")
+
+            # ── STEP 4: Generate explanation ────────────────────────────────────
             logging.info("[STEP 4] Generating natural language explanation...")
             explanation_chain = self.llm_service.create_explanation_chain()
-            
-            # Prepare input data for explanation
-            explanation_input = {
+            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+            explanation = explanation_chain.invoke({
                 "Question": user_query,
                 "schema_info": schema_context,
                 "results": str(results)
-            }
-            
-            # Add to input tokens for explanation
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
-            
-            explanation = explanation_chain.invoke(explanation_input)
-            
-            # Add to output tokens for explanation
+            })
             output_tokens += self.count_tokens(str(explanation))
-            
             logging.info("--- FINISHED PROCESSING QUERY ---")
-            
-            # Calculate execution time
+
+            # Audit successful execution in Mem0
+            if self.mem0_service:
+                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Success")
+
+            # ── Build response ──────────────────────────────────────────────────
             execution_time = time.time() - start_time
-            
-            # Calculate billing if service is available
             billing_info = None
             if self.billing_service:
                 billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens, user_id, session_id)
-            
-            # Prepare response
+
             response = {
                 "query": user_query,
-                "sql_queries": [{"sql": sql_queries[i], "order": i} for i in range(len(sql_queries))],
+                "sql_queries": [{"sql": final_sql_queries[i], "order": i} for i in range(len(final_sql_queries))],
                 "results": results,
                 "explanation": explanation,
                 "timestamp": datetime.now(),
@@ -275,31 +336,48 @@ class QueryService:
                 "user_id": user_id,
                 "session_id": session_id,
                 "message_id": message_id,
-                "company_id": company_id
+                "company_id": company_id,
+                "task_id": task_id
             }
-            
-            # Store in history
+
             self.query_history.append(response)
-            
-            # Persist to MongoDB if available
+
             if self.mongodb_service:
-                try:
-                    mongo_id = self.mongodb_service.save_result(response)
-                    response["mongodb_id"] = mongo_id
-                    logging.info(f"[INFO] Result saved to MongoDB with ID: {mongo_id}")
-                except Exception as e:
-                    logging.error(f"[ERROR] Failed to save to MongoDB: {e}")
-            
-            logging.info(f"[INFO] Query processed successfully in {execution_time:.2f}s | Tokens: In={input_tokens}, Out={output_tokens}")
+                if background_tasks:
+                    try:
+                        background_tasks.add_task(self.mongodb_service.save_result, response)
+                        logging.info("[INFO] Result scheduled to be saved to MongoDB in background via FastAPI BackgroundTasks.")
+                    except Exception as e:
+                        logging.error(f"[ERROR] Failed to schedule background task for MongoDB save: {e}")
+                else:
+                    # Fallback to background thread if background_tasks is not provided (e.g., in ThreadPoolExecutor)
+                    try:
+                        import threading
+                        def save_bg(mongodb_svc, resp):
+                            try:
+                                mongodb_svc.save_result(resp)
+                            except Exception as th_err:
+                                logging.error(f"[ERROR] Failed to save to MongoDB in background thread: {th_err}")
+                        
+                        threading.Thread(target=save_bg, args=(self.mongodb_service, response), daemon=True).start()
+                        logging.info("[INFO] Result scheduled to be saved to MongoDB in background thread.")
+                    except Exception as thread_err:
+                        logging.error(f"[ERROR] Failed to spawn background thread for MongoDB save: {thread_err}")
+
+            logging.info(f"[INFO] Done in {execution_time:.2f}s | Tokens: in={input_tokens} out={output_tokens}")
             return response
 
         except Exception as e:
             logging.error(f"[ERROR] process_query failed: {e}")
             raise
+
             
     async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
-                          user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None):
-        """Process natural language query and stream results chunk by chunk"""
+                          user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
+                          task_id: int = None):
+        """Process natural language query and stream results chunk by chunk.
+        Enforces schema discovery, RBAC, meta-query injection, auto-repair, explanation streaming, auditing, and persistence.
+        """
         start_time = time.time()
         input_tokens = self.count_tokens(user_query)
         output_tokens = 0
@@ -309,57 +387,230 @@ class QueryService:
             self.validate_prerequisites()
             yield json.dumps({"type": "status", "content": "Analyzing query and discovering schema..."}) + "\n"
             
+            # Fetch Mem0 Permissions
+            permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
+            if self.mem0_service:
+                if user_id:
+                    permissions = self.mem0_service.get_user_permissions(user_id)
+                    logging.info(f"[RBAC] [STREAM] Active permissions from Mem0: {permissions}")
+                
+                # Fetch task mapping if task_id is provided
+                if task_id:
+                    try:
+                        memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
+                        task_tables = None
+                        for m in memories:
+                            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+                            if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                                raw_tables = meta.get("tables", "[]")
+                                try:
+                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
+                                except Exception:
+                                    task_tables = []
+                                break
+                        
+                        if task_tables is not None:
+                            logging.info(f"[Task Security] Enforcing task {task_id} allowed tables: {task_tables}")
+                            # Override allowed_tables to restrict to the task's allowed tables
+                            if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
+                                u_allowed = {t.lower() for t in permissions["allowed_tables"]}
+                                t_allowed = {t.lower() for t in task_tables}
+                                permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
+                            else:
+                                permissions["allowed_tables"] = task_tables
+                            print(f"[Mem0 Tables] [STREAM] task_id: {task_id} | Allowed tables sent to LLM: {permissions['allowed_tables']}")
+                        else:
+                            logging.warning(f"[Task Security] Task {task_id} not found in Mem0. Access defaults to all tables.")
+                            permissions["allowed_tables"] = ["*"]
+                            print(f"[Mem0 Tables] [STREAM] task_id: {task_id} not found in Mem0 | Defaults sent to LLM: {permissions['allowed_tables']}")
+                    except Exception as task_err:
+                        logging.error(f"[Task Security] Failed to lookup task {task_id}: {task_err}")
+                else:
+                    # if no task_id then allowed all the table by default
+                    permissions["allowed_tables"] = ["*"]
+                    permissions["restricted_tables"] = []
+
             db_params = self.db_service.get_connection_params()
             db_name = db_params.get("database", "unknown")
-            
-            # 2. Schema Discovery (Step 1)
-            schema_context = ""
-            if self.neo4j_service and self.neo4j_service.is_connected():
-                try:
-                    concept_chain = self.llm_service.create_concept_extraction_chain()
-                    keywords_text = await concept_chain.ainvoke({"Question": user_query})
-                    keywords = [k.strip() for k in keywords_text.split(",") if k.strip()]
-                    
-                    anchors = self.neo4j_service.find_relevant_schema(db_name, keywords)
-                    if anchors:
-                        anchor_full_names = [a['full_name'] for a in anchors[:8]]
-                        bridges = self.neo4j_service.get_path_bridges(db_name, anchor_full_names)
-                        all_relevant_nodes = anchors + bridges
-                        schema_context = self._format_schema_capsules(all_relevant_nodes[:40], db_name)
-                except Exception as e:
-                    logging.warning(f"Neo4j discovery failed during stream: {e}")
-
-            # Fallback to Postgres if Neo4j failed or returned nothing
-            if not schema_context:
-                yield json.dumps({"type": "status", "content": "Neo4j unavailable, falling back to PostgreSQL schema..."}) + "\n"
-                schema_context = self.db_service.get_simplified_schema()
-
-            # 3. SQL Generation (Step 2)
             dialect = self.db_service.db_type
+
+            # Fetch simplified schema
+            allowed_tables = permissions.get("allowed_tables")
+            schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+            if not schema_context:
+                yield json.dumps({"type": "status", "content": "Falling back to database schema..."}) + "\n"
+                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+
+            if task_id:
+                schema_context = f"these are the table task_id {task_id} is allowed\nthese are the table task_id{task_id} is allowed\n\n" + schema_context
+
+            # Truncate if oversized
+            if len(schema_context) > settings.llm_max_context_chars:
+                logging.info(f"[STEP 1] Truncating schema from {len(schema_context)} → {settings.llm_max_context_chars} chars.")
+                schema_context = schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated...]"
+
+            # Meta-query injection
+            if self._detect_meta_query(user_query):
+                meta_context = self._get_meta_context(db_name, dialect)
+                schema_context = meta_context + "\n\n" + schema_context
+                logging.info("[STEP 1] Meta-query detected — injected information_schema context.")
+
+            # SQL Generation
             yield json.dumps({"type": "status", "content": f"Generating {dialect.upper()} query..."}) + "\n"
             sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
-            generated_text = await sql_gen_chain.ainvoke({
-                "Question": user_query,
-                "schema_context": schema_context
-            })
-            
+
+            augmented_query = user_query
+            if permissions.get("role") != "admin" and permissions.get("row_filters"):
+                filter_str = " AND ".join(permissions["row_filters"])
+                augmented_query += f"\n(CONSTRAINT: Ensure the generated SQL only returns records satisfying: {filter_str})"
+
+            if task_id and permissions.get("allowed_tables") and permissions["allowed_tables"] != ["*"]:
+                allowed_tables_str = ", ".join(permissions["allowed_tables"])
+                allowed_list_quoted = ", ".join(f"'{t}'" for t in permissions["allowed_tables"])
+                augmented_query += (
+                    f"\n(STRICT CONSTRAINT: You MUST only use and query the following allowed tables for task {task_id}: {allowed_tables_str}. "
+                    f"Do NOT generate SQL querying any other tables, even if they are listed in system metadata or elsewhere. "
+                    f"If you are querying system catalogs/metadata views (like information_schema.tables or information_schema.columns), "
+                    f"you MUST append a WHERE filter on the table name column (e.g., table_name IN ({allowed_list_quoted})) "
+                    f"so that ONLY the allowed tables are returned in the query results. "
+                    f"Never expose or query any other tables under any circumstances.)"
+                )
+
+            input_tokens += self.count_tokens(augmented_query) + self.count_tokens(schema_context)
+
+            try:
+                generated_text = await sql_gen_chain.ainvoke({
+                    "Question": augmented_query,
+                    "schema_context": schema_context
+                })
+                output_tokens += self.count_tokens(str(generated_text))
+                raw_output = str(generated_text).strip()
+                if not raw_output:
+                    raise RuntimeError(
+                        f"The LLM returned an empty response. This may happen with reasoning/thinking models."
+                    )
+                generated_text = raw_output
+            except Exception as sql_err:
+                err_str = str(sql_err)
+                logging.error(f"[STREAM] SQL generation failed: {err_str}")
+                cfg = self.llm_service.config_details or {}
+                llm_base = cfg.get("base_url", "the configured LLM server")
+                configured_model = cfg.get("model", "unknown")
+                if any(x in err_str for x in ["Connection error", "Connection refused", "10061", "NewConnectionError"]):
+                    raise RuntimeError(f"LLM server unreachable at '{llm_base}'. Check if the service is running.")
+                if "404" in err_str and ("not found" in err_str.lower() or "model" in err_str.lower()):
+                    c = self.llm_service.config_details
+                    if c and c.get("model") != settings.llm_model_name:
+                        logging.warning(f"⚠️ Auto-reverting model to '{settings.llm_model_name}' due to 404.")
+                        self.llm_service.configure(c.get("api_key"), c.get("base_url"), settings.llm_model_name, c.get("headers"), False)
+                        raise RuntimeError(f"Self-healed LLM config to '{settings.llm_model_name}'. Please re-run your query.")
+                    raise RuntimeError(f"Model '{configured_model}' not found on '{llm_base}'. Please re-configure.")
+                raise RuntimeError(f"SQL generation failed: {err_str}")
+
             sql_queries = extract_sql_queries(str(generated_text))
             if not sql_queries:
-                yield json.dumps({"type": "error", "content": "No SQL queries generated."}) + "\n"
-                return
+                raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
 
-            yield json.dumps({"type": "sql", "content": sql_queries}) + "\n"
+            # Post-Generation Guardrail Check on Generated SQL
+            allowed_tables = permissions.get("allowed_tables", ["*"])
+            try:
+                db_tables = self.db_service.get_tables()
+            except Exception:
+                db_tables = []
 
-            # 4. SQL Execution (Step 3)
+            if allowed_tables is not None and allowed_tables != ["*"]:
+                allowed_lower = {t.lower() for t in allowed_tables}
+                for sql in sql_queries:
+                    for table in db_tables:
+                        if table.lower() not in allowed_lower:
+                            if re.search(rf"\b{re.escape(table)}\b", sql, re.IGNORECASE):
+                                error_msg_rbac = f"Access Denied: You do not have permission to query table."
+                                logging.warning(f"[RBAC] [STREAM] BLOCKED user={user_id} | table='{table}' | sql={sql[:80]}")
+                                if self.mem0_service:
+                                    self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                                raise ValueError(error_msg_rbac)
+            elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
+                for sql in sql_queries:
+                    for restricted_table in permissions["restricted_tables"]:
+                        if re.search(rf"\b{restricted_table}\b", sql, re.IGNORECASE):
+                            error_msg_rbac = f"Access Denied: Query attempts to read restricted table ."
+                            logging.warning(f"[RBAC] [STREAM] User {user_id} blocked: restricted table '{restricted_table}'.")
+                            if self.mem0_service:
+                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                            raise ValueError(error_msg_rbac)
+
+            # 4. SQL Execution (with one auto-repair retry)
             yield json.dumps({"type": "status", "content": "Executing SQL and retrieving data..."}) + "\n"
             results = []
-            for query in sql_queries:
-                query_result = self.db_service.execute_query(query)
-                results.append(query_result)
-            
+            final_sql_queries = list(sql_queries)
+
+            for i, query in enumerate(final_sql_queries):
+                try:
+                    query_result = self.db_service.execute_query(query)
+                except Exception as exec_err:
+                    error_msg = str(exec_err)
+                    logging.warning(f"[STREAM] Q{i+1} failed: {error_msg}. Attempting auto-repair...")
+                    yield json.dumps({"type": "status", "content": f"Query execution failed: {error_msg}. Attempting auto-repair..."}) + "\n"
+
+                    try:
+                        repair_chain = self.llm_service.create_sql_repair_chain(dialect=dialect)
+                        repaired_sql = await repair_chain.ainvoke({
+                            "Question": augmented_query,
+                            "schema_context": schema_context,
+                            "failed_sql": query,
+                            "error_message": error_msg
+                        })
+                        output_tokens += self.count_tokens(str(repaired_sql))
+                        repaired_queries = extract_sql_queries(str(repaired_sql))
+                        if repaired_queries:
+                            repaired_query = repaired_queries[0]
+                            logging.info(f"[STREAM] Repaired SQL:\n{repaired_query}")
+                            
+                            # Post-Generation Guardrail Check on Repaired SQL
+                            allowed_tables = permissions.get("allowed_tables", ["*"])
+                            if allowed_tables is not None and allowed_tables != ["*"]:
+                                allowed_lower = {t.lower() for t in allowed_tables}
+                                for table in db_tables:
+                                    if table.lower() not in allowed_lower:
+                                        if re.search(rf"\b{re.escape(table)}\b", repaired_query, re.IGNORECASE):
+                                            error_msg_rbac = f"Access Denied: You do not have permission to query table."
+                                            logging.warning(f"[RBAC] [STREAM] BLOCKED user={user_id} | table='{table}' | sql={repaired_query[:80]}")
+                                            if self.mem0_service:
+                                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                                            raise ValueError(error_msg_rbac)
+
+                            if permissions.get("role") != "admin" and permissions.get("restricted_tables"):
+                                for restricted_table in permissions["restricted_tables"]:
+                                    if re.search(rf"\b{restricted_table}\b", repaired_query, re.IGNORECASE):
+                                        error_msg_rbac = f"Access Denied: Repaired query attempts to read restricted table ."
+                                        logging.warning(f"[RBAC] [STREAM] User {user_id} blocked: repaired query tried to access restricted table '{restricted_table}'.")
+                                        if self.mem0_service:
+                                            self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
+                                        raise ValueError(error_msg_rbac)
+                                        
+                            query_result = self.db_service.execute_query(repaired_query)
+                            final_sql_queries[i] = repaired_query  # record the repaired version
+                            logging.info(f"[STREAM] Repaired query executed successfully.")
+                        else:
+                            raise RuntimeError("Repair chain returned no valid SQL.")
+                    except Exception as repair_err:
+                        logging.error(f"[STREAM] Auto-repair also failed: {repair_err}")
+                        raise RuntimeError(
+                            f"Query execution failed and could not be auto-repaired.\n"
+                            f"Original error: {error_msg}\nRepair error: {repair_err}"
+                        )
+
+                # Normalise result format
+                query_result = self._filter_metadata_results(query_result, allowed_tables)
+                if isinstance(query_result, (list, dict)):
+                    results.append(query_result)
+                else:
+                    results.append({"raw_result": str(query_result)})
+
+            yield json.dumps({"type": "sql", "content": final_sql_queries}) + "\n"
             yield json.dumps({"type": "results", "content": results}) + "\n"
 
-            # 5. Explaining Results (Step 4 - The actual Stream)
+            # 5. Explaining Results (The actual Stream)
             yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
             explanation_chain = self.llm_service.create_explanation_chain()
             
@@ -369,18 +620,80 @@ class QueryService:
                 "results": str(results)
             }
             
+            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+            
             yield json.dumps({"type": "explanation_start"}) + "\n"
             full_explanation = ""
             async for chunk in explanation_chain.astream(explanation_input):
                 full_explanation += chunk
                 yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
             
-            # Final metadata
+            output_tokens += self.count_tokens(full_explanation)
+            
+            # Audit successful execution in Mem0
+            if self.mem0_service:
+                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Success")
+
+            # Calculate billing info
             execution_time = time.time() - start_time
-            yield json.dumps({
-                "type": "metadata", 
+            billing_info = None
+            if self.billing_service:
+                billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens, user_id, session_id)
+
+            # Build full response object for persistence & history
+            response = {
+                "query": user_query,
+                "sql_queries": [{"sql": final_sql_queries[i], "order": i} for i in range(len(final_sql_queries))],
+                "results": results,
+                "explanation": full_explanation,
+                "timestamp": datetime.now(),
                 "execution_time": execution_time,
-                "timestamp": datetime.now().isoformat()
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "billing": billing_info,
+                "user_id": user_id,
+                "session_id": session_id,
+                "message_id": message_id,
+                "company_id": company_id,
+                "task_id": task_id
+            }
+
+            self.query_history.append(response)
+
+            # Save to MongoDB asynchronously
+            if self.mongodb_service:
+                try:
+                    import threading
+                    def save_bg(mongodb_svc, resp):
+                        try:
+                            mongodb_svc.save_result(resp)
+                        except Exception as th_err:
+                            logging.error(f"[ERROR] [STREAM] Failed to save to MongoDB in background thread: {th_err}")
+                    
+                    threading.Thread(target=save_bg, args=(self.mongodb_service, response), daemon=True).start()
+                    logging.info("[INFO] [STREAM] Result scheduled to be saved to MongoDB in background thread.")
+                except Exception as thread_err:
+                    logging.error(f"[ERROR] [STREAM] Failed to spawn background thread for MongoDB save: {thread_err}")
+
+            # Yield final metadata matching QueryResult schema
+            yield json.dumps({
+                "type": "metadata",
+                "session_id": session_id,
+                "message_id": message_id,
+                "company_id": company_id,
+                "query": user_query,
+                "sql_queries": [{"sql": final_sql_queries[i], "order": i} for i in range(len(final_sql_queries))],
+                "results": results,
+                "explanation": full_explanation,
+                "timestamp": datetime.now().isoformat(),
+                "execution_time": execution_time,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "billing": billing_info,
+                "user_id": user_id,
+                "task_id": task_id
             }) + "\n"
 
         except Exception as e:
@@ -390,25 +703,74 @@ class QueryService:
     def _detect_meta_query(self, query: str) -> bool:
         """Detect if the query is asking about the database structure itself (metadata)."""
         meta_keywords = [
-            "number of tables", "how many tables", "list schemas", 
-            "database size", "database version", "all tables",
-            "metadata", "structure", "schema list"
+            # tables — all common phrasings
+            "number of tables", "how many tables", "list tables", "list table",
+            "all tables", "all the tables", "what are all the tables",
+            "what are the tables", "tables in the db", "tables in the database",
+            "tables exist", "available tables", "existing tables",
+            "show tables", "show table", "what tables", "which tables",
+            "tables available", "tables do we have", "tables are there",
+            # columns
+            "all the columns", "list columns", "list column", "show columns",
+            "show column", "what columns", "which columns", "all columns",
+            "column names", "column name",
+            # schemas / structure
+            "list schemas", "list schema", "all schemas", "database schema", "schema list",
+            "database size", "database version",
+            "metadata", "structure", "describe table", "describe tables",
         ]
         q_lower = query.lower()
         return any(kw in q_lower for kw in meta_keywords)
 
-    def _get_meta_context(self, db_name: str) -> str:
-        """Provide context for metadata queries (information_schema)."""
-        return f"""
-        This is a metadata query for the database '{db_name}'. 
-        You may use PostgreSQL system tables like:
-        - information_schema.tables (table_name, table_schema)
-        - information_schema.columns (table_name, column_name, data_type)
-        - pg_stat_user_tables (relname, n_live_tup as row_count)
-        
-        To count tables, use: SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog');
-        """
-    
+    def _get_meta_context(self, db_name: str, dialect: str = "postgresql") -> str:
+        """Provide dialect-aware context for metadata queries (information_schema)."""
+        dialect = (dialect or "postgresql").lower()
+
+        if dialect in ("sqlserver", "mssql"):
+            return f"""-- METADATA QUERY CONTEXT for database '{db_name}' (SQL Server)
+-- Use these system catalog views to answer structural questions:
+--   INFORMATION_SCHEMA.TABLES      : TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+--   INFORMATION_SCHEMA.COLUMNS     : TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+--   sys.tables                     : name, object_id, schema_id
+--   sys.columns                    : name, object_id, column_id, user_type_id
+--
+-- Examples:
+--   All tables:   SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME
+--   All columns:  SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = 'dbo' ORDER BY TABLE_NAME, ORDINAL_POSITION
+--   Row counts:   SELECT t.name AS table_name, p.rows AS row_count FROM sys.tables t JOIN sys.partitions p ON t.object_id = p.object_id WHERE p.index_id IN (0,1) ORDER BY p.rows DESC"""
+
+        elif dialect in ("mysql", "mariadb"):
+            return f"""-- METADATA QUERY CONTEXT for database '{db_name}' (MySQL)
+-- Use these system catalog views:
+--   INFORMATION_SCHEMA.TABLES   : TABLE_SCHEMA, TABLE_NAME, TABLE_ROWS
+--   INFORMATION_SCHEMA.COLUMNS  : TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+--
+-- Examples:
+--   All tables:   SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{db_name}'
+--   All columns:  SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{db_name}' ORDER BY TABLE_NAME, ORDINAL_POSITION"""
+
+        elif dialect in ("oracle",):
+            return f"""-- METADATA QUERY CONTEXT for database '{db_name}' (Oracle)
+-- Use these catalog views:
+--   ALL_TABLES  : OWNER, TABLE_NAME, NUM_ROWS
+--   ALL_COLUMNS : OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE
+--
+-- Examples:
+--   All tables:   SELECT OWNER, TABLE_NAME FROM ALL_TABLES ORDER BY OWNER, TABLE_NAME
+--   All columns:  SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE FROM ALL_TAB_COLUMNS ORDER BY TABLE_NAME, COLUMN_ID"""
+
+        else:  # postgresql default
+            return f"""-- METADATA QUERY CONTEXT for database '{db_name}' (PostgreSQL)
+-- Use these system catalog views to answer structural questions:
+--   information_schema.tables   : table_schema, table_name, table_type
+--   information_schema.columns  : table_schema, table_name, column_name, data_type, is_nullable
+--   pg_stat_user_tables         : schemaname, relname, n_live_tup (estimated row count)
+--
+-- Examples:
+--   Count tables: SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','pg_catalog')
+--   All columns:  SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position
+--   Row counts:   SELECT relname AS table_name, n_live_tup AS estimated_rows FROM pg_stat_user_tables ORDER BY n_live_tup DESC"""
+
     def _format_schema_capsules(self, nodes: List[Dict[str, Any]], db_name: str) -> str:
         """Format retrieved nodes as compressed schema capsules for high-scale reasoning"""
         if not nodes:
@@ -432,19 +794,53 @@ class QueryService:
             context += "---\n"
         return context
 
-    def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_history(self, limit: int = 10, message_id: Optional[str] = None, session_id: Optional[str] = None, company_id: Optional[str] = None, task_id: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get query history. Falls back to MongoDB if available for persistent history."""
         # Try to get from MongoDB for persistent history
-        if self.mongodb_service:
+        if self.mongodb_service and hasattr(self.mongodb_service, "is_ready") and self.mongodb_service.is_ready():
             try:
-                mongo_history = self.mongodb_service.get_history(limit)
+                mongo_history = self.mongodb_service.get_history(
+                    limit=limit,
+                    message_id=message_id,
+                    session_id=session_id,
+                    company_id=company_id,
+                    task_id=task_id,
+                    user_id=user_id
+                )
                 if mongo_history:
                     return mongo_history
             except Exception as e:
                 print(f"[ERROR] Failed to fetch history from MongoDB: {e}")
+        elif self.mongodb_service:
+            # Try calling without is_ready check in case of legacy connection wrapper
+            try:
+                mongo_history = self.mongodb_service.get_history(
+                    limit=limit,
+                    message_id=message_id,
+                    session_id=session_id,
+                    company_id=company_id,
+                    task_id=task_id,
+                    user_id=user_id
+                )
+                if mongo_history:
+                    return mongo_history
+            except Exception as e:
+                pass
         
         # Fallback to in-memory history
-        return self.query_history[-limit:] if self.query_history else []
+        results = self.query_history
+        if message_id:
+            results = [r for r in results if r.get("message_id") == message_id]
+        if session_id:
+            results = [r for r in results if r.get("session_id") == session_id]
+        if company_id:
+            results = [r for r in results if r.get("company_id") == company_id]
+        if task_id:
+            results = [r for r in results if r.get("task_id") == task_id]
+        if user_id:
+            results = [r for r in results if str(r.get("user_id")) == str(user_id)]
+            
+        return results[-limit:] if results else []
     
     def clear_history(self):
         """Clear query history"""
@@ -461,3 +857,48 @@ class QueryService:
         if not self.query_history:
             raise ValueError("No query results in history")
         return self.query_history[-1]
+
+    def _apply_schema_rbac(self, schema_context: str, restricted_tables: List[str]) -> str:
+        """
+        Parses the simplified schema text and removes any blocks associated with
+        restricted tables to hide columns and indices from SQL generation.
+        """
+        if not schema_context or not restricted_tables:
+            return schema_context
+            
+        lines = schema_context.split("\n")
+        filtered_lines = []
+        skip_block = False
+        
+        for line in lines:
+            if line.startswith("Table:") or line.startswith("CREATE TABLE"):
+                skip_block = False
+                for table in restricted_tables:
+                    if f".{table}" in line or f" {table}" in line or line.endswith(table):
+                        skip_block = True
+                        break
+            
+            if not skip_block:
+                filtered_lines.append(line)
+                
+        return "\n".join(filtered_lines)
+
+    def _filter_metadata_results(self, query_result: Any, allowed_tables: Optional[List[str]]) -> Any:
+        """Filter out any metadata/information_schema results that expose unauthorized tables."""
+        if allowed_tables is None or allowed_tables == ["*"] or not isinstance(query_result, list):
+            return query_result
+            
+        allowed_lower = {t.lower() for t in allowed_tables}
+        filtered_rows = []
+        for row in query_result:
+            if isinstance(row, dict):
+                is_unauthorized = False
+                for k, v in row.items():
+                    if k.lower() in ("table_name", "relname", "table"):
+                        if str(v).lower() not in allowed_lower:
+                            is_unauthorized = True
+                            break
+                if is_unauthorized:
+                    continue
+            filtered_rows.append(row)
+        return filtered_rows

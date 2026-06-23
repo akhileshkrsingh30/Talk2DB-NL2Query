@@ -1,0 +1,14 @@
+{
+  "ALL_ACCESS":             ["*"],
+  "MAIN_DASHBOARD":         ["Machines", "Assets", "Tickets", "MachineSecurityStatus"],
+  "ALL_ASSETS":             ["Assets", "AssetCategories", "AssetTypes"],
+  "ASSET_MACHINE_MAPPING":  ["AssetMachineMappings", "Machines"],
+  "ACTIVE_ASSIGNMENTS":     ["AssetAssignments"],
+  "ASSET_CATEGORY_MASTER":  ["AssetCategories"],
+  "ASSET_TYPE_MASTER":      ["AssetTypes"],
+  "ASSIGN_ASSETS":          ["AssetAssignments", "Assets", "AppUsers"],
+  "ALL_EMPLOYEES":          ["employees", "ERPEmployees", "AppUsers"],
+  "TICKET_LIST":            ["Tickets", "TicketStatus", "TicketPriority", "TicketCategory"],
+  "RAISE_TICKET":           ["Tickets", "TicketAttachments", "TicketComments"],
+  "MY_TASKS":               ["Tickets", "TicketSLA", "TicketHistory"]
+}

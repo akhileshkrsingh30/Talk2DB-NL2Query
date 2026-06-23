@@ -1,0 +1,33 @@
+{
+  "roles": {
+    "1": {
+      "RoleId": 1,
+      "RoleName": "Administrator",
+      "RoleCode": "ADMIN",
+      "SupportLevel": 5,
+      "AllowedPages": ["ALL_ACCESS"],
+      "Description": "System administrator"
+    },
+    "2": {
+      "RoleId": 2,
+      "RoleName": "L1 Support Engineer",
+      "RoleCode": "L1_SUPPORT",
+      "SupportLevel": 1,
+      "AllowedPages": ["MAIN_DASHBOARD","ALL_ASSETS","ASSET_MACHINE_MAPPING","ACTIVE_ASSIGNMENTS","ASSET_CATEGORY_MASTER","ASSET_TYPE_MASTER","ASSIGN_ASSETS"],
+      "Description": "L1 support engineer"
+    },
+    "4": {
+      "RoleId": 4,
+      "RoleName": "Employee",
+      "RoleCode": "EMP",
+      "SupportLevel": 0,
+      "AllowedPages": ["ALL_EMPLOYEES","TICKET_LIST","RAISE_TICKET","MY_TASKS"],
+      "Description": "Employee"
+    }
+  },
+  "users": [
+    {"Id": 2003, "Email": "jetly.2492@gmail.com", "EmployeeName": "Gourav", "AuthUserId": 1, "RoleId": 1},
+    {"Id": 2006, "Email": "anurag.priyadarshi@softelnetworks.com", "EmployeeName": "Anurag Priyadarshi", "AuthUserId": 322, "RoleId": 4},
+    {"Id": 2007, "Email": "jyoti.raut@softelnetworks.com", "EmployeeName": "Jyoti Raut", "AuthUserId": 404, "RoleId": 2}
+  ]
+}

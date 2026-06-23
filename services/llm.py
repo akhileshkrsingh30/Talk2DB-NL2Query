@@ -212,26 +212,132 @@ class LLMService:
             """
         )
         return prompt | self.llm | StrOutputParser()
-    
+
+    def create_sql_generation_chain(self, dialect="postgresql"):
+        """Generate high-quality SQL using a structured think → plan → write → verify approach"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured.")
+
+        prompt = ChatPromptTemplate.from_template(
+            f"""You are an expert {dialect.upper()} SQL engineer with deep knowledge of query optimization, JOIN strategies, and window functions.
+
+## DATABASE SCHEMA
+The ONLY tables and columns you are allowed to use:
+{{schema_context}}
+
+## USER QUESTION
+{{Question}}
+
+## YOUR TASK
+Follow these steps in your head before writing the final SQL:
+
+STEP 1 — UNDERSTAND
+- What data does the user want? (rows, aggregates, trends, comparisons?)
+- What filters, groupings, or sort orders are implied?
+
+STEP 2 — MAP TO SCHEMA
+- Which tables contain the required data?
+- Identify all necessary JOIN keys between those tables.
+- Confirm every column you plan to use exists in the schema above.
+- If a needed column is ambiguous, qualify it with its table name.
+
+STEP 3 — PLAN THE QUERY STRUCTURE
+- Simple lookup → plain SELECT with WHERE
+- Aggregation (count/sum/avg) → GROUP BY + HAVING
+- Multiple related tables → JOIN with explicit ON conditions
+- 3+ tables or self-referencing → use CTEs (WITH clauses) for readability
+- Rankings, running totals, percentages → use window functions (ROW_NUMBER, RANK, SUM OVER, etc.)
+- Time-series trends → GROUP BY date truncation (DATE_TRUNC for PostgreSQL)
+
+STEP 4 — WRITE THE SQL
+Apply these quality rules:
+- Always alias tables (e.g., orders o, customers c)
+- Use COALESCE to handle NULLs in aggregations
+- Add meaningful column aliases in SELECT (e.g., AS total_revenue)
+- Apply LIMIT 100 unless the question asks for all rows or a count
+- Use proper {dialect.upper()} syntax for date functions, string ops, and casting
+- For MSSQL use TOP instead of LIMIT; for Oracle use FETCH FIRST N ROWS ONLY
+
+STEP 5 — VERIFY
+- Every table referenced exists in the schema.
+- Every column referenced exists in its table.
+- All JOINs have matching data types on both sides.
+- No hallucinated table or column names.
+
+## ABSOLUTE CONSTRAINTS
+1. Use ONLY tables and columns from the schema above. Zero exceptions.
+2. If the question cannot be answered from the given schema, return exactly:
+   SELECT 'Insufficient schema context to answer this question' AS message;
+3. Return ONLY the final raw SQL statement. No markdown, no ```, no explanation text.
+
+SQL Query:"""
+        )
+        return prompt | self.llm | StrOutputParser()
+
+    def create_sql_repair_chain(self, dialect="postgresql"):
+        """Repair a failed SQL query given the error message and schema"""
+        if not self.is_configured():
+            raise RuntimeError("LLM not configured.")
+
+        prompt = ChatPromptTemplate.from_template(
+            f"""You are an expert {dialect.upper()} SQL debugger.
+
+## DATABASE SCHEMA
+{{schema_context}}
+
+## ORIGINAL QUESTION
+{{Question}}
+
+## FAILED SQL
+{{failed_sql}}
+
+## ERROR MESSAGE
+{{error_message}}
+
+## YOUR TASK
+Fix the SQL so it runs correctly. Common issues to check:
+- Column name typo → replace with exact name from schema
+- Ambiguous column → qualify with table alias
+- Wrong JOIN key → use the correct foreign key from schema
+- Syntax error → fix to valid {dialect.upper()} syntax
+- Missing GROUP BY → add all non-aggregated SELECT columns
+- Type mismatch in JOIN or WHERE → cast appropriately
+
+Return ONLY the corrected raw SQL. No explanation, no markdown.
+
+Fixed SQL:"""
+        )
+        return prompt | self.llm | StrOutputParser()
+
     def create_explanation_chain(self):
-        """Create natural language explanation chain"""
+        """Generate a rich, structured natural-language response grounded in query results"""
         if not self.is_configured():
             raise RuntimeError("LLM not configured. Cannot create explanation chain.")
-            
+
         return ChatPromptTemplate.from_template(
-            """You are a helpful data assistant. Given a user's question, the database schema, and the results of a SQL query, provide a clear and concise natural language explanation of the results.
+            """You are a professional data analyst presenting findings to a business stakeholder.
 
-            User's Question: {Question}
-            Database Schema: {schema_info}
-            Query Results: {results}
+User's Question: {Question}
+Database Schema Used: {schema_info}
+Query Results: {results}
 
-            CRITICAL GROUNDING RULES:
-            1. ONLY answer based on the provided "Query Results". 
-            2. If the results say "Insufficient schema context", inform the user that the specific data requested was not found.
-            3. NEVER invent numbers (e.g., do not say 'There are 50 tables' if the results don't specifically contain that number).
-            4. If the results are empty, state that no information was found for that specific question.
-            5. Use plain text only. NO Markdown. NO asterisks (**), NO bolding, NO backticks.
-            """
+YOUR TASK:
+Write a clear, well-structured answer that directly addresses the user's question using ONLY the data in "Query Results".
+
+STRUCTURE GUIDELINES:
+1. Start with a one-sentence direct answer to the question.
+2. Present the key data points clearly (use numbered lists for multiple items).
+3. Highlight the most important finding, trend, or outlier if present.
+4. If results are empty, say clearly: "No records were found matching this query."
+5. If results contain "Insufficient schema context" or indicate insufficient data/schema to answer the question, do NOT say "Insufficient schema context" or "The required data could not be found". Instead, analyze the "Database Schema Used" and write the response by proposing 3 likely, relevant natural language queries the user could run. These suggested queries must directly reference actual table names and column names present in the schema to guide the user (e.g. "list all the tables", "list the dbo.assets table with asset name and cost", or "show all dbo.employees").
+6. End with a brief summary sentence only if there are 5 or more result rows.
+
+STRICT FORMATTING RULES:
+- Plain text only. NO Markdown. NO asterisks (**). NO hashtags (#). NO backticks (`).
+- Use simple numbered lists (1. 2. 3.) or dashes (- ) for listing items.
+- Do NOT invent any numbers, names, or facts not present in the query results (except when proposing the 3 likely queries under guideline 5 using the provided schema).
+- Keep the response concise: aim for 3-10 sentences for small result sets, up to 20 for large ones.
+"""
         ) | self.llm | StrOutputParser()
 
     def create_concept_extraction_chain(self):
@@ -324,31 +430,6 @@ class LLMService:
         )
         return prompt | self.llm | StrOutputParser()
 
-    def create_sql_generation_chain(self, dialect="postgresql"):
-        """Step 2: Generate final SQL from filtered schema context"""
-        if not self.is_configured():
-            raise RuntimeError("LLM not configured.")
-
-        prompt = ChatPromptTemplate.from_template(
-            f"""You are a strict {dialect.upper()} SQL generator. Your ONLY job is to write SQL using the EXACT tables and columns listed below.
-
-AVAILABLE SCHEMA (you may ONLY use these tables and columns):
-{{schema_context}}
-
-User's Question: {{Question}}
-
-ABSOLUTE RULES - Violations will cause runtime errors:
-1. DO NOT use ANY table not explicitly listed in the schema above.
-2. DO NOT invent or guess column names. Use ONLY the exact column names shown above.
-3. DO NOT reference any table from your training data or general knowledge.
-4. Make your best effort to construct the query using the available schema context, even if some column names require an educated guess. Only return SELECT 'Insufficient schema context to answer this question' AS message; if the provided tables are completely irrelevant to the question.
-5. Return ONLY the raw SQL statement. No markdown, no ```, no explanation.
-6. Use correct {dialect.upper()} syntax.
-7. Always limit the results unless the question requires a full count. (Use LIMIT for Postgres/MySQL, TOP for MSSQL, FETCH FIRST for Oracle).
-
-SQL Query:"""
-        )
-        return prompt | self.llm | StrOutputParser()
 
     def create_mongodb_chain(self):
         """Create MongoDB query chain - generates MongoDB find queries from natural language"""

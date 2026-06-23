@@ -11,8 +11,7 @@ from schemas import DatabaseConnection, DatabaseSelect, ConnectionResponse, Data
 from services.database import DatabaseService, convert_realdict_to_dict
 from services.llm import LLMService
 from services.mongodb import MongoDBService
-from services.neo4j_service import Neo4jService
-from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service, get_neo4j_service
+from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service, get_mem0_service
 
 router = APIRouter(prefix="/database", tags=["database"])
 
@@ -27,8 +26,6 @@ async def connect_to_database(
     connection: DatabaseConnection,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
-    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
-    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Connect to a PostgreSQL database"""
@@ -70,21 +67,6 @@ async def connect_to_database(
             except Exception as e:
                 print(f"Failed to auto-push schema to MongoDB: {e}")
 
-            # NEW: Push schema to Neo4j if not already present
-            try:
-                db_name = connection.database or "postgres"
-                if neo4j_service.is_connected():
-                    if not neo4j_service.schema_exists(db_name):
-                        print(f"Schema for {db_name} not found in Neo4j. Pushing now...")
-                        schema_dict = db_service.get_schema_dict()
-                        neo4j_service.push_schema(db_name, schema_dict)
-                        print(f"Successfully pushed schema for {db_name} to Neo4j")
-                    else:
-                        print(f"Schema for {db_name} already exists in Neo4j. Skipping push.")
-                else:
-                    print("Neo4j not connected. Skipping schema sync.")
-            except Exception as e:
-                print(f"Failed to sync schema to Neo4j: {e}")
 
             return ConnectionResponse(
                 status="success",
@@ -175,7 +157,6 @@ async def select_database(
     selection: DatabaseSelect,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
-    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Switch to a specific database after listing them"""
@@ -189,21 +170,6 @@ async def select_database(
             except Exception as e:
                 print(f"Failed to auto-push schema to MongoDB: {e}")
 
-            # NEW: Push schema to Neo4j if not already present
-            try:
-                db_name = selection.database
-                if neo4j_service.is_connected():
-                    if not neo4j_service.schema_exists(db_name):
-                        print(f"Schema for {db_name} not found in Neo4j. Pushing now...")
-                        schema_dict = db_service.get_schema_dict()
-                        neo4j_service.push_schema(db_name, schema_dict)
-                        print(f"Successfully pushed schema for {db_name} to Neo4j")
-                    else:
-                        print(f"Schema for {db_name} already exists in Neo4j. Skipping push.")
-                else:
-                    print("Neo4j not connected. Skipping schema sync.")
-            except Exception as e:
-                print(f"Failed to sync schema to Neo4j: {e}")
 
             params = db_service.get_connection_params()
             return ConnectionResponse(
@@ -273,6 +239,94 @@ async def get_database_status(
         return ConnectionResponse(
             status="disconnected",
             message=f"Database is not connected. (Configured for {settings.db_host or 'none'})"
+        )
+
+@router.get("/tables", response_model=Dict[str, Any], responses={400: {"model": ErrorResponse}})
+async def list_tables(
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)],
+    task_id: Optional[int] = None,
+    mem0_service: Annotated[Any, Depends(get_mem0_service)] = None
+):
+    """List all tables in the currently connected database (filtered by active permissions)"""
+    try:
+        if not db_service.is_connected():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Database not connected. Please connect first using /database/connect endpoint."
+            )
+        
+        tables = db_service.get_tables()
+        
+        # Resolve permissions
+        permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
+        if mem0_service:
+            if current_user:
+                try:
+                    permissions = mem0_service.get_user_permissions(current_user)
+                except Exception:
+                    permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": []}
+
+            if task_id:
+                try:
+                    memories = mem0_service.client.get_all(filters={"user_id": "global"})
+                    task_tables = None
+                    for m in memories:
+                        meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+                        if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                            raw_tables = meta.get("tables", "[]")
+                            try:
+                                import json
+                                task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
+                            except Exception:
+                                task_tables = []
+                            break
+                    
+                    if task_tables is not None:
+                        if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
+                            u_allowed = {t.lower() for t in permissions["allowed_tables"]}
+                            t_allowed = {t.lower() for t in task_tables}
+                            permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
+                        else:
+                            permissions["allowed_tables"] = task_tables
+                    else:
+                        permissions["allowed_tables"] = ["*"]
+                except Exception:
+                    permissions["allowed_tables"] = ["*"]
+            else:
+                # if no task_id then allowed all the table by default
+                permissions["allowed_tables"] = ["*"]
+                permissions["restricted_tables"] = []
+
+        # Filter the tables list based on resolved permissions
+        role = permissions.get("role", "standard")
+        if role != "admin":
+            allowed_tables = permissions.get("allowed_tables")
+            if allowed_tables is not None and allowed_tables != ["*"]:
+                allowed_lower = {t.lower() for t in allowed_tables}
+                tables = [t for t in tables if t.lower() in allowed_lower]
+            elif permissions.get("restricted_tables"):
+                restricted_lower = {t.lower() for t in permissions["restricted_tables"]}
+                tables = [t for t in tables if t.lower() not in restricted_lower]
+        
+        params = db_service.get_connection_params()
+        return {
+            "status": "success",
+            "database": params.get("database") if params else None,
+            "tables": tables,
+            "count": len(tables)
+        }
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list tables: {str(e)}"
         )
 
 @router.post("/test-llm-connection", response_model=dict)
@@ -494,4 +548,136 @@ async def execute_sql_batch(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"SQL batch execution failed: {str(e)}"
+        )
+
+@router.get("/tables/{table_name}/data", responses={400: {"model": ErrorResponse}, 403: {"model": ErrorResponse}})
+async def get_table_data(
+    table_name: str,
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mem0_service: Annotated[Any, Depends(get_mem0_service)],
+    current_user: Annotated[str, Depends(verify_token)],
+    limit: int = 100,
+    offset: int = 0,
+    task_id: Optional[str] = None
+):
+    """
+    Fetch records/data from a specific database table, subject to RBAC and optional task limits.
+    """
+    if not db_service.is_connected():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Database not connected."
+        )
+
+    # 1. Resolve tables and check existence
+    try:
+        db_tables = db_service.get_tables()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch database tables: {str(e)}"
+        )
+
+    # Case-insensitive match to find the actual table name
+    safe_table = None
+    for t in db_tables:
+        if t.lower() == table_name.lower():
+            safe_table = t
+            break
+
+    if not safe_table:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Table '{table_name}' does not exist in the connected database."
+        )
+
+    # 2. RBAC Permissions Enforcement
+    permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
+    if mem0_service:
+        if current_user:
+            try:
+                permissions = mem0_service.get_user_permissions(current_user)
+            except Exception as e:
+                # Default standard permissions if fetch fails
+                permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": []}
+
+        # Resolve task mapping if task_id is provided
+        if task_id:
+            try:
+                memories = mem0_service.client.get_all(filters={"user_id": "global"})
+                task_tables = None
+                for m in memories:
+                    meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+                    if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                        raw_tables = meta.get("tables", "[]")
+                        try:
+                            import json
+                            task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
+                        except Exception:
+                            task_tables = []
+                        break
+                
+                if task_tables is not None:
+                    # Restrict allowed_tables to task_tables
+                    if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
+                        u_allowed = {t.lower() for t in permissions["allowed_tables"]}
+                        t_allowed = {t.lower() for t in task_tables}
+                        permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
+                    else:
+                        permissions["allowed_tables"] = task_tables
+                else:
+                    permissions["allowed_tables"] = ["*"]
+            except Exception as task_err:
+                # Restrict all access if task lookup fails
+                permissions["allowed_tables"] = ["*"]
+        else:
+            # if no task_id then allowed all the table by default
+            permissions["allowed_tables"] = ["*"]
+            permissions["restricted_tables"] = []
+
+    # 3. Check if table is allowed
+    allowed_tables = permissions.get("allowed_tables", ["*"])
+    if allowed_tables is not None and allowed_tables != ["*"]:
+        allowed_lower = {t.lower() for t in allowed_tables}
+        if safe_table.lower() not in allowed_lower:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: You do not have permission to query table."
+            )
+    elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
+        restricted_lower = {t.lower() for t in permissions["restricted_tables"]}
+        if safe_table.lower() in restricted_lower:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied: Query attempts to read restricted table."
+            )
+
+    # 4. Construct Dialect-Aware Query (fully safe as table name comes from get_tables())
+    try:
+        limit = max(1, min(limit, 1000)) # clamp between 1 and 1000
+        offset = max(0, offset)
+
+        if db_service.db_type == "mssql":
+            if offset > 0:
+                query = f"SELECT * FROM {safe_table} ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+            else:
+                query = f"SELECT TOP {limit} * FROM {safe_table}"
+        elif db_service.db_type == "oracle":
+            query = f"SELECT * FROM {safe_table} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+        else: # postgresql / mysql default
+            query = f"SELECT * FROM {safe_table} LIMIT {limit} OFFSET {offset}"
+
+        data = db_service.execute_query(query)
+        return {
+            "status": "success",
+            "table": safe_table,
+            "count": len(data),
+            "limit": limit,
+            "offset": offset,
+            "data": data
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch data: {str(e)}"
         )

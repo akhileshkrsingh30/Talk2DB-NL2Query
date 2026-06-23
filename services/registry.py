@@ -4,7 +4,7 @@ from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
 from services.mongodb import MongoDBService
-from services.neo4j_service import Neo4jService
+from services.mem0_service import Mem0Service
 
 
 class ServiceRegistry:
@@ -16,7 +16,7 @@ class ServiceRegistry:
         self._sharing_service: Optional[SharingService] = None
         self._billing_service: Optional[BillingService] = None
         self._mongodb_service: Optional[MongoDBService] = None
-        self._neo4j_service: Optional[Neo4jService] = None
+        self._mem0_service: Optional[Mem0Service] = None
     
     def set_db_service(self, service: DatabaseService):
         self._db_service = service
@@ -58,14 +58,14 @@ class ServiceRegistry:
             raise RuntimeError("MongoDB service not initialized")
         return self._mongodb_service
 
-    def set_neo4j_service(self, service: Neo4jService):
-        self._neo4j_service = service
+    def set_mem0_service(self, service: Mem0Service):
+        self._mem0_service = service
     
-    def get_neo4j_service(self) -> Neo4jService:
-        if self._neo4j_service is None:
-            raise RuntimeError("Neo4j service not initialized")
-        return self._neo4j_service
-    
+    def get_mem0_service(self) -> Mem0Service:
+        if self._mem0_service is None:
+            raise RuntimeError("Mem0 service not initialized")
+        return self._mem0_service
+
     def cleanup(self):
         """Cleanup all services"""
         if self._db_service:
@@ -75,9 +75,7 @@ class ServiceRegistry:
         self._sharing_service = None
         self._billing_service = None
         self._mongodb_service = None
-        if self._neo4j_service:
-            self._neo4j_service.disconnect()
-        self._neo4j_service = None
+        self._mem0_service = None
 
 # Global service registry instance
 service_registry = ServiceRegistry()

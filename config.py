@@ -42,10 +42,16 @@ class Settings(BaseSettings):
     mongo_uri: str = Field("mongodb://localhost:27017/", env="MONGO_URI")
     mongo_db_name: str = Field("ValoDSS", env="MONGO_DB_NAME")
     
-    # Neo4j configuration
-    neo4j_uri: str = Field("bolt://localhost:7687", env="NEO4J_URI")
-    neo4j_user: str = Field("neo4j", env="NEO4J_USER")
-    neo4j_password: str = Field("password", env="NEO4J_PASSWORD")
+    # Mem0 configuration
+    mem0_vector_store_provider: str = Field("qdrant", env="MEM0_VECTOR_STORE_PROVIDER")
+    mem0_pg_connection_string: str = Field("postgresql://postgres:postgres@localhost:5432/postgres", env="MEM0_PG_CONNECTION_STRING")
+    mem0_qdrant_host: str = Field("localhost", env="MEM0_QDRANT_HOST")
+    mem0_qdrant_port: int = Field(6333, env="MEM0_QDRANT_PORT")
+    mem0_qdrant_url: Optional[str] = Field(None, env="MEM0_QDRANT_URL")
+    mem0_qdrant_api_key: Optional[str] = Field(None, env="MEM0_QDRANT_API_KEY")
+    mem0_collection_name: str = Field("mem0_rbac", env="MEM0_COLLECTION_NAME")
+    mem0_embedding_model: str = Field("text-embedding-3-small", env="MEM0_EMBEDDING_MODEL")
+    mem0_llm_model: str = Field("gpt-4o", env="MEM0_LLM_MODEL")
     
     # Application settings
     app_title: str = "Database Query API"
@@ -70,8 +76,6 @@ class Settings(BaseSettings):
         print(f"   MODEL_NAME: {self.llm_model_name}")
         print(f"   MONGO_URI: {self.mongo_uri}")
         print(f"   MONGO_DB_NAME: {self.mongo_db_name}")
-        print(f"   NEO4J_URI: {self.neo4j_uri}")
-        print(f"   NEO4J_USER: {self.neo4j_user}")
         print(f"   MAX_CONTEXT_CHARS: {self.llm_max_context_chars}")
         print(f"   MAX_OUTPUT_TOKENS: {self.llm_max_output_tokens}")
         

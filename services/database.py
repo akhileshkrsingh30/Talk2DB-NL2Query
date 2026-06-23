@@ -83,7 +83,11 @@ class DatabaseService:
     def connect(self, connection_params: Dict[str, Any]) -> bool:
         """Establish database connection"""
         try:
-            self.db_type = connection_params.get("db_type", settings.db_type).lower()
+            db_type = connection_params.get("db_type", settings.db_type).lower()
+            if db_type in ["mssql", "sqlserver"]:
+                self.db_type = "mssql"
+            else:
+                self.db_type = db_type
             
             # Validate required parameters (database is optional for Postgres but needed for MySQL sometimes)
             required_fields = ["host", "port", "user", "password"]
@@ -225,6 +229,67 @@ class DatabaseService:
                     return [row['datname'] if isinstance(row, dict) else row[0] for row in rows]
         except Exception as e:
             raise RuntimeError(f"Failed to list databases: {str(e)}")
+
+    def get_tables(self) -> List[str]:
+        """List all user tables in the connected database"""
+        if not self.connected:
+            raise RuntimeError("Database not connected")
+            
+        try:
+            with self.create_connection() as conn:
+                cursor = conn.cursor()
+                if self.db_type in ["mysql", "mariadb"]:
+                    cursor.execute(
+                        """
+                        SELECT table_name 
+                        FROM information_schema.tables 
+                        WHERE table_schema = %s AND table_type = 'BASE TABLE'
+                        ORDER BY table_name
+                        """, (self.connection_params["database"],)
+                    )
+                elif self.db_type == "mssql":
+                    cursor.execute(
+                        """
+                        SELECT TABLE_NAME 
+                        FROM INFORMATION_SCHEMA.TABLES 
+                        WHERE TABLE_TYPE = 'BASE TABLE'
+                        ORDER BY TABLE_NAME
+                        """
+                    )
+                elif self.db_type == "oracle":
+                    cursor.execute(
+                        """
+                        SELECT table_name 
+                        FROM all_tables 
+                        WHERE owner = %s
+                        ORDER BY table_name
+                        """, (self.connection_params["user"].upper(),)
+                    )
+                else:  # postgresql default
+                    cursor.execute(
+                        """
+                        SELECT table_name 
+                        FROM information_schema.tables 
+                        WHERE table_schema NOT IN ('pg_catalog', 'information_schema') AND table_type = 'BASE TABLE'
+                        ORDER BY table_name
+                        """
+                    )
+                
+                rows = cursor.fetchall()
+                tables = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        val = row.get("table_name") or row.get("TABLE_NAME")
+                        if val is None:
+                            val = next(iter(row.values()))
+                        tables.append(val)
+                    elif isinstance(row, tuple):
+                        tables.append(row[0])
+                    else:
+                        tables.append(str(row))
+                return tables
+        except Exception as e:
+            raise RuntimeError(f"Failed to list tables: {str(e)}")
     
     def select_database(self, db_name: str) -> bool:
         """Switch to a specific database using current connection credentials"""
@@ -389,20 +454,22 @@ class DatabaseService:
         except Exception as e:
             raise RuntimeError(f"Query execution failed: {str(e)}")
 
-    def get_simplified_schema(self) -> str:
+    def get_simplified_schema(self, allowed_tables: Optional[List[str]] = None) -> str:
         if not self.connected:
             raise RuntimeError("Database not connected")
+        use_cache = allowed_tables is None or allowed_tables == ["*"]
         key = make_db_cache_key(self.connection_params or {})
-        try:
-            entry = self._schema_cache.get(key)
-            if entry:
-                generated_at = entry.get("generated_at")
-                if isinstance(generated_at, datetime):
-                    age = (datetime.now() - generated_at).total_seconds()
-                    if age < getattr(self, "_schema_cache_ttl_seconds", 300):
-                        return entry["text"]
-        except Exception:
-            pass
+        if use_cache:
+            try:
+                entry = self._schema_cache.get(key)
+                if entry:
+                    generated_at = entry.get("generated_at")
+                    if isinstance(generated_at, datetime):
+                        age = (datetime.now() - generated_at).total_seconds()
+                        if age < getattr(self, "_schema_cache_ttl_seconds", 300):
+                            return entry["text"]
+            except Exception:
+                pass
         try:
             with self.create_connection() as conn:
                 cursor = conn.cursor()
@@ -512,7 +579,17 @@ class DatabaseService:
         MAX_COLS = 60
         lines: List[str] = []
         count_tables = 0
+        
+        # Prepare allowed tables set if filtering is enabled
+        allowed_lower = None
+        if allowed_tables is not None and allowed_tables != ["*"]:
+            allowed_lower = {t.lower() for t in allowed_tables}
+            
         for (schema, table), columns in tables.items():
+            # If allowed_tables filter is active, skip any tables not in the list
+            if allowed_lower is not None and table.lower() not in allowed_lower:
+                continue
+                
             if count_tables >= MAX_TABLES:
                 break
             parts: List[str] = []
@@ -530,10 +607,11 @@ class DatabaseService:
         text = "\n".join(lines)
         if len(text) > 16000:
             text = text[:16000]
-        try:
-            self._schema_cache[key] = {"text": text, "generated_at": datetime.now()}
-        except Exception:
-            pass
+        if use_cache:
+            try:
+                self._schema_cache[key] = {"text": text, "generated_at": datetime.now()}
+            except Exception:
+                pass
         return text
 
     def get_schema_dict(self) -> Dict[str, Any]:

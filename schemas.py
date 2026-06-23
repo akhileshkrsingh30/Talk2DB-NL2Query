@@ -29,6 +29,7 @@ class QueryRequest(BaseModel):
     max_tokens: Optional[int] = Field(1024, description="Maximum tokens for LLM response")
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
+    task_id: Optional[int] = Field(None, description="Optional task ID to restrict query execution to the tables mapped to this task")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")
@@ -49,6 +50,7 @@ class QueryResult(BaseModel):
     total_tokens: Optional[int] = Field(None, description="Total number of tokens used")
     billing: Optional[Dict[str, Any]] = Field(None, description="Billing and cost information")
     user_id: Optional[str] = Field(None, description="User identifier from request")
+    task_id: Optional[int] = Field(None, description="Optional task ID associated with the query")
     
     class Config:
         # Allow any additional fields that might come from the database
@@ -97,6 +99,7 @@ class BatchQueryRequest(BaseModel):
     queries: List[QueryRequest]
     parallel: Optional[bool] = Field(False, description="Execute multiple natural language queries in parallel")
     max_concurrency: Optional[int] = Field(5, description="Maximum parallel workers", ge=1, le=32)
+    task_id: Optional[int] = Field(None, description="Optional top-level task ID to apply to all queries in the batch")
 
 class BatchQueryResult(BaseModel):
     results: List[QueryResult]
@@ -183,3 +186,32 @@ class MongoDBQueryResult(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat(),
         }
+
+# ============================================================================
+# RBAC Schemas
+# ============================================================================
+
+class UserPolicyRequest(BaseModel):
+    username: str = Field(..., description="Target user identifier (email/username)")
+    role: str = Field("standard", description="User role (standard, manager, admin)")
+    department: str = Field(..., description="User department")
+    restricted_tables: List[str] = Field(default_factory=list, description="List of table names user is restricted from querying")
+
+class UserPolicyRawRequest(BaseModel):
+    username: Optional[str] = Field(None, description="Target user identifier (optional if agent_id is provided)")
+    agent_id: Optional[str] = Field(None, description="Target agent identifier (optional if username is provided)")
+    memory: str = Field(..., description="Raw natural language policy memory to store")
+
+class UserPolicyResponse(BaseModel):
+    username: str = Field(..., description="Target user identifier")
+    resolved_permissions: Dict[str, Any] = Field(..., description="Parsed permissions rules currently active for the user")
+
+class MemoryStoreRequest(BaseModel):
+    content: str = Field(..., description="The content/text data to store in memory")
+    user_id: Optional[str] = Field(None, description="The user identifier to associate the memory with")
+    agent_id: Optional[str] = Field(None, description="The agent identifier to associate the memory with")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional key-value metadata to store with the memory")
+
+class MemoriesRequest(BaseModel):
+    task_id: int = Field(..., description="The ID of the task")
+    tables: List[str] = Field(..., description="List of tables associated with the task")

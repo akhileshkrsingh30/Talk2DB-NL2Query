@@ -338,9 +338,15 @@ async def stream_mongodb_query(
             detail="LLM is not configured."
         )
 
+    headers = {
+        "Content-Type": "application/x-ndjson",
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
     return StreamingResponse(
         mongodb_service.stream_query(query_request, llm_service, current_user),
-        media_type="application/x-ndjson"
+        headers=headers
     )
 
 @router.post("/process", response_model=MongoDBQueryResult, responses={400: {"model": ErrorResponse}})

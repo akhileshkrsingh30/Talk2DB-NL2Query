@@ -9,16 +9,31 @@ from services.registry import service_registry
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
-from services.billing.billing_service import BillingService
 from services.mongodb import MongoDBService
-from services.neo4j_service import Neo4jService
+from services.billing.billing_service import BillingService
+from services.mem0_service import Mem0Service
 from config import settings
 import os
 
 def get_db_service() -> DatabaseService:
     """Dependency to get database service instance"""
     try:
-        return service_registry.get_db_service()
+        service = service_registry.get_db_service()
+        # If not connected, try to auto-connect using environment settings
+        if not service.is_connected():
+            if all([settings.db_host, settings.db_port, settings.db_user, settings.db_password]):
+                try:
+                    service.connect({
+                        "host": settings.db_host,
+                        "port": settings.db_port,
+                        "database": settings.db_name,
+                        "user": settings.db_user,
+                        "password": settings.db_password,
+                        "db_type": settings.db_type
+                    })
+                except Exception:
+                    pass # Fail silently, let subsequent checks raise appropriate error
+        return service
     except RuntimeError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -110,27 +125,36 @@ def get_mongodb_service() -> MongoDBService:
             detail=str(e)
         )
 
-def get_neo4j_service() -> Neo4jService:
-    """Dependency to get Neo4j service instance with auto-reconnect logic"""
+def get_mem0_service() -> Mem0Service:
+    """Dependency to get Mem0 service instance"""
     try:
-        service = service_registry.get_neo4j_service()
-        # If not connected, try to auto-connect using environment settings
-        if not service.is_connected():
-            if all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):
-                try:
-                    service.connect(
-                        settings.neo4j_uri,
-                        settings.neo4j_user,
-                        settings.neo4j_password
-                    )
-                except Exception:
-                    pass # Fail silently, Step 1 in query will log the warning if still fails
-        return service
+        return service_registry.get_mem0_service()
     except RuntimeError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+def get_user_id_from_token(token: str) -> Optional[str]:
+    import base64
+    import json
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1]
+            # Fix base64 padding
+            padding = "=" * (4 - len(payload_b64) % 4)
+            payload_decoded = base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8")
+            payload_data = json.loads(payload_decoded)
+            
+            # Check for userId, user_id, or sub
+            uid = payload_data.get("userId") or payload_data.get("user_id") or payload_data.get("sub")
+            if uid is not None:
+                return str(uid)
+    except Exception:
+        pass
+    return None
 
 def verify_token(authorization: Annotated[Optional[str], Header()] = None) -> str:
     """
@@ -168,6 +192,14 @@ def verify_token(authorization: Annotated[Optional[str], Header()] = None) -> st
             )
         
         username = match.group(1)
+        
+        # Try to parse the token directly to see if we can extract the user ID
+        token_str = authorization.replace("Bearer ", "").strip()
+        user_id_from_token = get_user_id_from_token(token_str)
+        
+        if user_id_from_token:
+            return user_id_from_token
+            
         return username
         
     except HTTPException:

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
 from typing import List, Optional, Dict, Any, Annotated
 
 from datetime import datetime
@@ -10,14 +10,13 @@ from services.llm import LLMService
 from services.query import QueryService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
-from services.neo4j_service import Neo4jService
 from dependencies import (
     get_db_service, 
     get_llm_service, 
     get_sharing_service, 
     get_billing_service,
     get_mongodb_service,
-    get_neo4j_service,
+    get_mem0_service,
     verify_token
 )
 
@@ -28,11 +27,10 @@ def get_query_service(
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     billing_service: Annotated[BillingService, Depends(get_billing_service)],
     mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
-    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)]
+    mem0_service: Annotated[Any, Depends(get_mem0_service)]
 ) -> QueryService:
     """Get a fresh query service instance with current service states"""
-    # Always create a fresh instance to ensure we have the latest service states
-    return QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
+    return QueryService(db_service, llm_service, billing_service, mongodb_service, mem0_service)
 
 from fastapi.responses import StreamingResponse
 
@@ -40,7 +38,8 @@ from fastapi.responses import StreamingResponse
 async def process_natural_language_query(
     query_request: QueryRequest,
     query_service: Annotated[QueryService, Depends(get_query_service)],
-    current_user: Annotated[str, Depends(verify_token)]
+    current_user: Annotated[str, Depends(verify_token)],
+    background_tasks: BackgroundTasks
 ) -> Any:
     """Process a natural language query and return SQL results"""
     try:
@@ -51,7 +50,9 @@ async def process_natural_language_query(
             user_id=current_user,
             session_id=query_request.session_id,
             message_id=query_request.message_id,
-            company_id=query_request.company_id
+            company_id=query_request.company_id,
+            background_tasks=background_tasks,
+            task_id=query_request.task_id
         )
         return result
         
@@ -88,6 +89,12 @@ async def stream_natural_language_query(
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Stream natural language query results chunk by chunk"""
+    headers = {
+        "Content-Type": "application/x-ndjson",
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
     return StreamingResponse(
         query_service.stream_query(
             user_query=query_request.query,
@@ -96,9 +103,10 @@ async def stream_natural_language_query(
             user_id=current_user,
             session_id=query_request.session_id,
             message_id=query_request.message_id,
-            company_id=query_request.company_id
+            company_id=query_request.company_id,
+            task_id=query_request.task_id
         ),
-        media_type="application/x-ndjson"
+        headers=headers
     )
 
 @router.post("/process-batch", response_model=BatchQueryResult, responses={400: {"model": ErrorResponse}})
@@ -108,8 +116,9 @@ async def process_natural_language_query_batch(
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     billing_service: Annotated[BillingService, Depends(get_billing_service)],
     mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
-    neo4j_service: Annotated[Neo4jService, Depends(get_neo4j_service)],
-    current_user: Annotated[str, Depends(verify_token)]
+    mem0_service: Annotated[Any, Depends(get_mem0_service)],
+    current_user: Annotated[str, Depends(verify_token)],
+    background_tasks: BackgroundTasks
 ):
     try:
         if not db_service.is_connected():
@@ -135,8 +144,9 @@ async def process_natural_language_query_batch(
             results: List[QueryResult] = [None] * len(batch_request.queries)
 
             def run_item(index: int, q):
+                item_task_id = q.task_id if q.task_id is not None else batch_request.task_id
                 try:
-                    service = QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
+                    service = QueryService(db_service, llm_service, billing_service, mongodb_service, mem0_service)
                     return service.process_query(
                         user_query=q.query, 
                         max_tokens=q.max_tokens, 
@@ -144,7 +154,9 @@ async def process_natural_language_query_batch(
                         user_id=current_user,
                         session_id=q.session_id,
                         message_id=q.message_id,
-                        company_id=q.company_id
+                        company_id=q.company_id,
+                        background_tasks=background_tasks,
+                        task_id=item_task_id
                     )
                 except Exception as e:
                     # Return a partial failure result instead of crashing
@@ -161,7 +173,8 @@ async def process_natural_language_query_batch(
                         user_id=current_user,
                         session_id=q.session_id,
                         message_id=q.message_id,
-                        company_id=q.company_id
+                        company_id=q.company_id,
+                        task_id=item_task_id
                     )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -173,9 +186,10 @@ async def process_natural_language_query_batch(
                     idx = future_map[future]
                     results[idx] = future.result()
         else:
-            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service, neo4j_service)
+            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service, mem0_service)
             results: List[QueryResult] = []
             for item in batch_request.queries:
+                item_task_id = item.task_id if item.task_id is not None else batch_request.task_id
                 try:
                     res = query_service.process_query(
                         user_query=item.query,
@@ -184,7 +198,9 @@ async def process_natural_language_query_batch(
                         user_id=current_user,
                         session_id=item.session_id,
                         message_id=item.message_id,
-                        company_id=item.company_id
+                        company_id=item.company_id,
+                        background_tasks=background_tasks,
+                        task_id=item_task_id
                     )
                     results.append(res)
                 except Exception as e:
@@ -198,7 +214,8 @@ async def process_natural_language_query_batch(
                         user_id=current_user,
                         session_id=item.session_id,
                         message_id=item.message_id,
-                        company_id=item.company_id
+                        company_id=item.company_id,
+                        task_id=item_task_id
                     ))
 
         total_time = time.time() - start_time
@@ -250,7 +267,8 @@ async def process_and_share_query(
     request: Request,
     query_service: Annotated[QueryService, Depends(get_query_service)],
     sharing_service: Annotated[SharingService, Depends(get_sharing_service)],
-    current_user: Annotated[str, Depends(verify_token)]
+    current_user: Annotated[str, Depends(verify_token)],
+    background_tasks: BackgroundTasks
 ):
     """Process a natural language query and immediately share the result"""
     try:
@@ -260,7 +278,9 @@ async def process_and_share_query(
             max_tokens=query_request.max_tokens,
             temperature=query_request.temperature,
             user_id=current_user,
-            session_id=query_request.session_id
+            session_id=query_request.session_id,
+            background_tasks=background_tasks,
+            task_id=query_request.task_id
         )
         
         # Share the result
@@ -309,10 +329,48 @@ async def process_and_share_query(
 async def get_query_history(
     query_service: Annotated[QueryService, Depends(get_query_service)],
     current_user: Annotated[str, Depends(verify_token)],
+    limit: int = 10,
+    message_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    company_id: Optional[str] = None,
+    task_id: Optional[int] = None,
+    user_id: Optional[str] = None
+):
+    """Get query history with optional filtering by message_id, session_id, company_id, task_id, or user_id"""
+    return query_service.get_history(
+        limit=limit,
+        message_id=message_id,
+        session_id=session_id,
+        company_id=company_id,
+        task_id=task_id,
+        user_id=user_id
+    )
+
+@router.get("/history/task/{task_id}", response_model=List[QueryResult])
+async def get_query_history_by_task(
+    task_id: int,
+    query_service: Annotated[QueryService, Depends(get_query_service)],
+    current_user: Annotated[str, Depends(verify_token)],
     limit: int = 10
 ):
-    """Get query history"""
-    return query_service.get_history(limit)
+    """Get query history filtered by a specific task_id"""
+    return query_service.get_history(
+        limit=limit,
+        task_id=task_id
+    )
+
+@router.get("/history/user/{user_id}", response_model=List[QueryResult])
+async def get_query_history_by_user(
+    user_id: str,
+    query_service: Annotated[QueryService, Depends(get_query_service)],
+    current_user: Annotated[str, Depends(verify_token)],
+    limit: int = 10
+):
+    """Get query history filtered by a specific user_id"""
+    return query_service.get_history(
+        limit=limit,
+        user_id=user_id
+    )
 
 @router.post("/{query_index}/share", response_model=ShareResponse, responses={400: {"model": ErrorResponse}})
 async def share_historical_query(

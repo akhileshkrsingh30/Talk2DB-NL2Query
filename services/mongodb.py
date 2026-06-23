@@ -425,8 +425,8 @@ class MongoDBService:
             print(f"Error saving to MongoDB: {e}")
             return None
 
-    def get_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get history of queries from MongoDB (legacy method)"""
+    def get_history(self, limit: int = 10, message_id: Optional[str] = None, session_id: Optional[str] = None, company_id: Optional[str] = None, task_id: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get history of queries from MongoDB with optional filters"""
         if not self.is_connected():
             return []
         
@@ -437,7 +437,20 @@ class MongoDBService:
                     self.db = self.client[self.current_database or "admin"]
                 self.collection = self.db["query_results"]
             
-            cursor = self.collection.find().sort("timestamp", -1).limit(limit)
+            # Build filter dict
+            query_filter = {}
+            if message_id:
+                query_filter["message_id"] = message_id
+            if session_id:
+                query_filter["session_id"] = session_id
+            if company_id:
+                query_filter["company_id"] = company_id
+            if task_id:
+                query_filter["task_id"] = task_id
+            if user_id:
+                query_filter["user_id"] = user_id
+                
+            cursor = self.collection.find(query_filter).sort("timestamp", -1).limit(limit)
             results = []
             for doc in cursor:
                 doc["_id"] = str(doc["_id"])

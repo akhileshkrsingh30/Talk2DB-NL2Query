@@ -22,13 +22,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from config import settings
-from routers import database, queries, sharing, llm_config, mongodb
+from routers import database, queries, sharing, llm_config, mongodb, rbac, memories
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
 from services.mongodb import MongoDBService
-from services.neo4j_service import Neo4jService
+from services.mem0_service import Mem0Service
 from services.registry import service_registry
 from schemas import HealthCheck
 from dependencies import verify_token
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
     sharing_service = SharingService()
     billing_service = BillingService()
     mongodb_service = MongoDBService()
-    neo4j_service = Neo4jService()
+    mem0_service = Mem0Service()
     
     # Register services in the registry
     service_registry.set_db_service(db_service)
@@ -52,22 +52,15 @@ async def lifespan(app: FastAPI):
     service_registry.set_sharing_service(sharing_service)
     service_registry.set_billing_service(billing_service)
     service_registry.set_mongodb_service(mongodb_service)
-    service_registry.set_neo4j_service(neo4j_service)
+    service_registry.set_mem0_service(mem0_service)
     
-    # 1. Connect to Neo4j first so it's ready for DB schema sync
-    if all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):
-        try:
-            print(f"Connecting to Neo4j at {settings.neo4j_uri}...")
-            neo4j_service.connect(
-                settings.neo4j_uri,
-                settings.neo4j_user,
-                settings.neo4j_password
-            )
-            print("Neo4j connected successfully")
-        except Exception as e:
-            print(f"Neo4j auto-connection failed: {e}")
+    # Initialize Mem0
+    try:
+        mem0_service.initialize()
+    except Exception as e:
+        print(f"Mem0 initialization warning/error: {e}")
 
-    # 2. Try to connect to database and sync to Neo4j if available
+    # 2. Try to auto-connect to database
     if all([settings.db_host, settings.db_port, settings.db_name, settings.db_user]):
         try:
             print(f"Connecting to database {settings.db_name} at {settings.db_host}...")
@@ -80,20 +73,6 @@ async def lifespan(app: FastAPI):
                 "db_type": settings.db_type
             })
             print("Database connected successfully")
-
-            # Sync schema to Neo4j if possible
-            try:
-                if neo4j_service.is_connected():
-                    db_name = settings.db_name or "postgres"
-                    if not neo4j_service.schema_exists(db_name):
-                        print(f"Schema for {db_name} not found in Neo4j. Pushing now...")
-                        schema_dict = db_service.get_schema_dict()
-                        neo4j_service.push_schema(db_name, schema_dict)
-                        print(f"Successfully pushed schema for {db_name} to Neo4j")
-                else:
-                    print("Neo4j not connected. Skipping schema sync.")
-            except Exception as e:
-                print(f"Failed to sync schema to Neo4j during auto-connect: {e}")
         except Exception as e:
             print(f"Database auto-connection failed: {e}")
 
@@ -149,6 +128,8 @@ app.include_router(mongodb.router, dependencies=[Depends(verify_token)])
 app.include_router(queries.router, dependencies=[Depends(verify_token)])
 app.include_router(sharing.router, dependencies=[Depends(verify_token)])
 app.include_router(llm_config.router, dependencies=[Depends(verify_token)])
+app.include_router(rbac.router, dependencies=[Depends(verify_token)])
+app.include_router(memories.router, dependencies=[Depends(verify_token)])
 
 @app.get("/", include_in_schema=False)
 async def root():
@@ -184,8 +165,6 @@ async def get_configuration():
     try:
         db_service = service_registry.get_db_service()
         llm_service = service_registry.get_llm_service()
-        neo4j_service = service_registry.get_neo4j_service()
-        
         return {
             "db_host": settings.db_host,
             "db_port": settings.db_port,
@@ -194,8 +173,7 @@ async def get_configuration():
             "openai_api_base": settings.openai_api_base,
             "model_name": settings.llm_model_name,
             "db_connected": db_service.is_connected(),
-            "llm_configured": llm_service.is_configured(),
-            "neo4j_connected": neo4j_service.is_connected()
+            "llm_configured": llm_service.is_configured()
         }
     except Exception:
         return {
@@ -209,6 +187,43 @@ async def get_configuration():
             "llm_configured": False
         }
 
+def load_page_to_tables() -> dict:
+    import os
+    import json
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.join(base_dir, "page_to_tables.json")
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Failed to load page_to_tables.json: {e}")
+        return {}
+
+PAGE_TO_TABLES = load_page_to_tables()
+
+def resolve_allowed_tables(allowed_pages: list) -> list:
+    if "ALL_ACCESS" in allowed_pages:
+        return ["*"]
+    tables = set()
+    for page in allowed_pages:
+        tables.update(PAGE_TO_TABLES.get(page, []))
+    return sorted(tables)
+
+@app.api_route("/push-db-roles", methods=["GET", "POST"], tags=["rbac"])
+async def push_db_roles():
+    mem0_service = service_registry.get_mem0_service()
+    if not mem0_service or not mem0_service.is_ready():
+        return {"status": "error", "message": "Mem0 not ready"}
+        
+    try:
+        mem0_service.invalidate_cache()
+        return {
+            "status": "success",
+            "message": "RBAC cache invalidated. Permissions will be resolved dynamically from the database."
+        }
+    except Exception as err:
+        return {"status": "error", "message": f"Cache invalidation failed: {str(err)}"}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
