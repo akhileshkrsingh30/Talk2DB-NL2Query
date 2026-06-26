@@ -26,6 +26,7 @@ async def connect_to_database(
     connection: DatabaseConnection,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Connect to a PostgreSQL database"""
@@ -206,9 +207,7 @@ async def get_database_schema(
                 detail="Database not connected"
             )
         
-        db = db_service.get_langchain_db()
-        schema_info = db.get_table_info()
-        
+        schema_info = db_service.get_simplified_schema()
         return DatabaseSchema(schema_info=schema_info)
     except Exception as e:
         raise HTTPException(
@@ -455,7 +454,7 @@ async def execute_sql_batch(
                         for idx, sql in enumerate(batch.queries):
                             try:
                                 cursor.execute(sql)
-                                if sql.strip().lower().startswith("select"):
+                                if sql.strip().lower().startswith(("select", "with", "show", "describe", "explain")):
                                     rows = cursor.fetchall()
                                     result = convert_realdict_to_dict(rows)
                                 else:

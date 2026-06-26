@@ -433,7 +433,8 @@ class DatabaseService:
                 with conn.cursor() as cursor:
                     cursor.execute(sql_query)
                     
-                    if sql_query.strip().lower().startswith("select"):
+                    is_select = sql_query.strip().lower().startswith(("select", "with", "show", "describe", "explain"))
+                    if is_select:
                         results = cursor.fetchall()
                         elapsed = time.time() - start_time
                         # Convert RealDictRow objects to regular dictionaries

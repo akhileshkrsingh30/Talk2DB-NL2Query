@@ -158,54 +158,34 @@ def get_user_id_from_token(token: str) -> Optional[str]:
 
 def verify_token(authorization: Annotated[Optional[str], Header()] = None) -> str:
     """
-    Validate token with external API and extract identity.
-    Flow: Backend forwards JWT -> External API -> Parse Identity
+    Authentication removed/bypassed. 
+    Attempts to extract identity from the authorization header if provided,
+    otherwise falls back to the default administrator 'jetly.2492@gmail.com'.
     """
+    default_user = "jetly.2492@gmail.com"
+    
     if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Access token is missing!"
-        )
+        return default_user
     
     try:
-        # Validate token with external API
-        response = requests.get(
-            settings.auth_api_url, 
-            headers={"Authorization": authorization},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Invalid or expired token"
-            )
-
-        # Extract identity from API response
-        # Format: "Hello, jyoti.raut@softelnetworks.com! This is a protected API."
-        match = re.search(r"Hello, (.+?)! This is a protected API", response.text)
-        if not match:
-            # If the format is slightly different, we try to preserve the username
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Failed to parse identity from auth service"
-            )
-        
-        username = match.group(1)
-        
         # Try to parse the token directly to see if we can extract the user ID
         token_str = authorization.replace("Bearer ", "").strip()
         user_id_from_token = get_user_id_from_token(token_str)
-        
         if user_id_from_token:
             return user_id_from_token
             
-        return username
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token validation failed: {str(e)}"
+        # Try validation with external API
+        response = requests.get(
+            settings.auth_api_url, 
+            headers={"Authorization": authorization},
+            timeout=3
         )
+        
+        if response.status_code == 200:
+            match = re.search(r"Hello, (.+?)! This is a protected API", response.text)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+        
+    return default_user

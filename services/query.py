@@ -63,15 +63,18 @@ class QueryService:
                 if user_id:
                     permissions = self.mem0_service.get_user_permissions(user_id)
                     logging.info(f"[RBAC] Active permissions from Mem0: {permissions}")
+                    print(f"[Mem0 RBAC Return] Active permissions for user {user_id}: {permissions}")
                 
                 # Fetch task mapping if task_id is provided
                 if task_id:
                     try:
                         memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
+                        print(f"[Mem0 Raw Return] Raw memories fetched from Mem0: {memories}")
                         task_tables = None
                         for m in memories:
                             meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
                             if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                                print(f"[Mem0 Matched Memory] Found task mapping in Mem0: {m}")
                                 raw_tables = meta.get("tables", "[]")
                                 try:
                                     task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
@@ -393,15 +396,18 @@ class QueryService:
                 if user_id:
                     permissions = self.mem0_service.get_user_permissions(user_id)
                     logging.info(f"[RBAC] [STREAM] Active permissions from Mem0: {permissions}")
+                    print(f"[Mem0 RBAC Return] [STREAM] Active permissions for user {user_id}: {permissions}")
                 
                 # Fetch task mapping if task_id is provided
                 if task_id:
                     try:
                         memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
+                        print(f"[Mem0 Raw Return] [STREAM] Raw memories fetched from Mem0: {memories}")
                         task_tables = None
                         for m in memories:
                             meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
                             if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                                print(f"[Mem0 Matched Memory] [STREAM] Found task mapping in Mem0: {m}")
                                 raw_tables = meta.get("tables", "[]")
                                 try:
                                     task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
