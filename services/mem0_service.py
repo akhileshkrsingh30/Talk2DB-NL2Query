@@ -64,14 +64,14 @@ class Mem0Service:
                     "provider": "openai",
                     "config": {
                         "model":   settings.mem0_llm_model,
-                        "api_key": settings.openai_api_key or settings.krutim_cloud_api_key,
+                        "api_key": settings.openai_api_key,
                     }
                 },
                 "embedder": {
                     "provider": "openai",
                     "config": {
                         "model":   settings.mem0_embedding_model,
-                        "api_key": settings.openai_api_key or settings.krutim_cloud_api_key,
+                        "api_key": settings.openai_api_key,
                     }
                 },
             }

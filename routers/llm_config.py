@@ -10,8 +10,8 @@ from typing import Optional
 router = APIRouter(prefix="/llm", tags=["llm-config"])
 
 class LLMConfigRequest(BaseModel):
-    api_key: Optional[str] = Field(None, description="Krutim AI API key (falls back to .env if not provided)")
-    api_base: Optional[str] = Field(None, description="Krutim AI API base URL (falls back to .env if not provided)")
+    api_key: Optional[str] = Field(None, description="OpenAI API key (falls back to .env if not provided)")
+    api_base: Optional[str] = Field(None, description="OpenAI API base URL (falls back to .env if not provided)")
     model: Optional[str] = Field(None, description="Model name (falls back to .env if not provided)")
 
 class LLMConfigResponse(BaseModel):
@@ -25,10 +25,10 @@ async def configure_llm(
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
-    """Configure the LLM service with Krutim AI credentials"""
+    """Configure the LLM service"""
     try:
         # Fallback logic
-        api_key = config.api_key or settings.krutim_cloud_api_key or settings.openai_api_key
+        api_key = config.api_key or settings.openai_api_key
         api_base = config.api_base or settings.openai_api_base
         model = config.model or settings.llm_model_name
 

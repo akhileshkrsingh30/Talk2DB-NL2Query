@@ -52,7 +52,8 @@ async def process_natural_language_query(
             message_id=query_request.message_id,
             company_id=query_request.company_id,
             background_tasks=background_tasks,
-            task_id=query_request.task_id
+            task_id=query_request.task_id,
+            explain=query_request.explain
         )
         return result
         
@@ -104,7 +105,8 @@ async def stream_natural_language_query(
             session_id=query_request.session_id,
             message_id=query_request.message_id,
             company_id=query_request.company_id,
-            task_id=query_request.task_id
+            task_id=query_request.task_id,
+            explain=query_request.explain
         ),
         headers=headers
     )
@@ -121,10 +123,10 @@ async def process_natural_language_query_batch(
     background_tasks: BackgroundTasks
 ):
     try:
-        if not db_service.is_connected():
+        if not db_service.is_connected() and not mongodb_service.is_connected():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database is not connected. Please connect to a database using /database/connect endpoint first."
+                detail="Database is not connected. Please connect to a database or MongoDB first."
             )
 
         if not llm_service.is_configured():
@@ -156,7 +158,8 @@ async def process_natural_language_query_batch(
                         message_id=q.message_id,
                         company_id=q.company_id,
                         background_tasks=background_tasks,
-                        task_id=item_task_id
+                        task_id=item_task_id,
+                        explain=q.explain
                     )
                 except Exception as e:
                     # Return a partial failure result instead of crashing
@@ -200,7 +203,8 @@ async def process_natural_language_query_batch(
                         message_id=item.message_id,
                         company_id=item.company_id,
                         background_tasks=background_tasks,
-                        task_id=item_task_id
+                        task_id=item_task_id,
+                        explain=item.explain
                     )
                     results.append(res)
                 except Exception as e:
@@ -280,7 +284,8 @@ async def process_and_share_query(
             user_id=current_user,
             session_id=query_request.session_id,
             background_tasks=background_tasks,
-            task_id=query_request.task_id
+            task_id=query_request.task_id,
+            explain=query_request.explain
         )
         
         # Share the result

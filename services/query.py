@@ -44,12 +44,255 @@ class QueryService:
                 error_msg += f" Current config state: {config_details}"
             raise ValueError(error_msg)
         
+    def process_mongodb_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
+                              user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
+                              background_tasks: Any = None, task_id: int = None, explain: bool = False) -> Dict[str, Any]:
+        """Process natural language query for MongoDB and return results."""
+        print(f"[DEBUG] process_mongodb_query called with explain={explain}")
+        start_time = time.time()
+        logging.info(f"--- START PROCESSING MONGODB QUERY: '{user_query[:80]}' ---")
+
+        if not self.llm_service.is_configured():
+            raise ValueError("LLM is not configured. Please configure the LLM service first.")
+
+        if not self.mongodb_service or not self.mongodb_service.is_connected():
+            raise ValueError("MongoDB is not connected.")
+
+        if not self.mongodb_service.current_collection:
+            # Try to auto-select collection based on user query or allowed list
+            try:
+                collections = self.mongodb_service.get_collections()
+                allowed_collections = collections
+                
+                # Check user/task permissions if available
+                if self.mem0_service:
+                    permissions = {"role": "standard", "allowed_tables": ["*"]}
+                    if user_id:
+                        try:
+                            permissions = self.mem0_service.get_user_permissions(user_id)
+                        except Exception:
+                            pass
+                    if task_id:
+                        try:
+                            memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
+                            for m in memories:
+                                meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+                                if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                                    raw_tables = meta.get("tables", "[]")
+                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
+                                    if task_tables:
+                                        allowed_collections = [c for c in collections if c.lower() in [t.lower() for t in task_tables]]
+                                    break
+                        except Exception:
+                            pass
+                
+                # Case 1: Match collection names in user query (case-insensitive)
+                matched_col = None
+                import re
+                for col in allowed_collections:
+                    if re.search(r'\b' + re.escape(col) + r'\b', user_query, re.IGNORECASE):
+                        matched_col = col
+                        break
+                
+                if matched_col:
+                    self.mongodb_service.select_collection(matched_col)
+                    logging.info(f"Auto-selected collection '{matched_col}' based on user query.")
+                # Case 2: Only 1 collection is available/allowed, auto-select it
+                elif len(allowed_collections) == 1:
+                    self.mongodb_service.select_collection(allowed_collections[0])
+                    logging.info(f"Auto-selected single allowed collection '{allowed_collections[0]}'.")
+                # Case 3: LLM-assisted selection
+                elif len(allowed_collections) > 1:
+                    selector_prompt = f"""Given the user query: "{user_query}"
+And the list of available MongoDB collections: {allowed_collections}
+
+Which collection is the query asking about?
+If the query is a general question about the database, its schema, or doesn't target any specific collection, return "None".
+Otherwise, return the exact name of the collection from the list. Do not include any other text, quotes, or formatting.
+"""
+                    llm = self.llm_service.get_llm()
+                    response = llm.invoke(selector_prompt)
+                    choice = response.content.strip().replace('"', '').replace("'", "")
+                    if choice in allowed_collections:
+                        self.mongodb_service.select_collection(choice)
+                        logging.info(f"LLM auto-selected collection '{choice}' based on user query.")
+            except Exception as auto_err:
+                logging.error(f"Error during MongoDB collection auto-selection: {auto_err}")
+
+        if not self.mongodb_service.current_collection:
+            # Check if this is a general database/metadata query
+            is_metadata_query = any(word in user_query.lower() for word in [
+                "what is data about", "database about", "about the database", 
+                "what data", "show collections", "list collections", "what is in",
+                "explain database", "overview", "what collections"
+            ])
+            if is_metadata_query:
+                collections = self.mongodb_service.get_collections()
+                explanation_prompt = f"""The user is asking a general question about a MongoDB database.
+Database: {self.mongodb_service.current_database}
+Available collections: {collections}
+
+User Question: {user_query}
+
+Provide a helpful, professional overview of the database and what collections it contains, explaining what they represent if their names suggest it.
+"""
+                llm = self.llm_service.get_llm()
+                ans = llm.invoke(explanation_prompt)
+                
+                execution_time = time.time() - start_time
+                response = {
+                    "query": user_query,
+                    "sql_queries": None,
+                    "mongo_query": {"action": "list_collections"},
+                    "results": [{"collections": collections}],
+                    "explanation": ans.content.strip(),
+                    "timestamp": datetime.now(),
+                    "execution_time": execution_time,
+                    "input_tokens": self.count_tokens(user_query) + 50,
+                    "output_tokens": self.count_tokens(ans.content),
+                    "total_tokens": self.count_tokens(user_query) + 50 + self.count_tokens(ans.content),
+                    "billing": None,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "company_id": company_id,
+                    "task_id": task_id
+                }
+                self.query_history.append(response)
+                
+                # Save to database in background
+                if background_tasks:
+                    try:
+                        background_tasks.add_task(self.mongodb_service.save_result, response)
+                    except Exception as e:
+                        logging.error(f"[ERROR] Failed to schedule background task for MongoDB save: {e}")
+                else:
+                    try:
+                        import threading
+                        def save_bg(mongodb_svc, resp):
+                            try:
+                                mongodb_svc.save_result(resp)
+                            except Exception as th_err:
+                                logging.error(f"[ERROR] Failed to save to MongoDB in background thread: {th_err}")
+                        threading.Thread(target=save_bg, args=(self.mongodb_service, response), daemon=True).start()
+                    except Exception as thread_err:
+                        logging.error(f"[ERROR] Failed to spawn background thread for MongoDB save: {thread_err}")
+                return response
+            else:
+                raise ValueError("No collection selected. Select a collection first using POST /database/select.")
+
+        # Get collection schema for the LLM
+        schema_description = self.mongodb_service.get_schema_description()
+
+        input_tokens = self.count_tokens(user_query) + self.count_tokens(schema_description)
+        output_tokens = 0
+
+        # Generate MongoDB query using LLM
+        mongo_chain = self.llm_service.create_mongodb_chain()
+        generated_text = mongo_chain.invoke({
+            "Question": user_query,
+            "schema_info": schema_description
+        })
+        
+        output_tokens += self.count_tokens(str(generated_text))
+        
+        # Clean up and parse the query
+        cleaned_text = generated_text.strip()
+        cleaned_text = re.sub(r'^```(?:json)?\s*', '', cleaned_text)
+        cleaned_text = re.sub(r'\s*```$', '', cleaned_text)
+        cleaned_text = cleaned_text.strip()
+        
+        try:
+            query_dict = json.loads(cleaned_text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"LLM generated invalid JSON. Raw output: {generated_text[:500]}. Error: {str(e)}")
+            
+        # Execute the query
+        results = self.mongodb_service.execute_query(query_dict)
+        
+        # Generate explanation
+        explanation = None
+        if explain:
+            explanation_chain = self.llm_service.create_mongodb_explanation_chain()
+            results_for_explanation = results[:20] if len(results) > 20 else results
+            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_description)
+            explanation = explanation_chain.invoke({
+                "Question": user_query,
+                "schema_info": schema_description,
+                "results": str(results_for_explanation)
+            })
+            output_tokens += self.count_tokens(str(explanation))
+
+        execution_time = time.time() - start_time
+        
+        # Calculate cost
+        billing_info = None
+        if self.billing_service:
+            billing_info = self.billing_service.calculate_cost(input_tokens, output_tokens, user_id, session_id)
+
+        response = {
+            "query": user_query,
+            "sql_queries": None,
+            "mongo_query": query_dict,
+            "results": results,
+            "explanation": explanation,
+            "timestamp": datetime.now(),
+            "execution_time": execution_time,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "billing": billing_info,
+            "user_id": user_id,
+            "session_id": session_id,
+            "message_id": message_id,
+            "company_id": company_id,
+            "task_id": task_id
+        }
+
+        self.query_history.append(response)
+
+        # Save to database in background
+        if background_tasks:
+            try:
+                background_tasks.add_task(self.mongodb_service.save_result, response)
+            except Exception as e:
+                logging.error(f"[ERROR] Failed to schedule background task for MongoDB save: {e}")
+        else:
+            try:
+                import threading
+                def save_bg(mongodb_svc, resp):
+                    try:
+                        mongodb_svc.save_result(resp)
+                    except Exception as th_err:
+                        logging.error(f"[ERROR] Failed to save to MongoDB in background thread: {th_err}")
+                threading.Thread(target=save_bg, args=(self.mongodb_service, response), daemon=True).start()
+            except Exception as thread_err:
+                logging.error(f"[ERROR] Failed to spawn background thread for MongoDB save: {thread_err}")
+
+        print(f"[DEBUG] Returning response with explanation={explanation}")
+        return response
+
     def process_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                       user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                      background_tasks: Any = None, task_id: int = None) -> Dict[str, Any]:
+                      background_tasks: Any = None, task_id: int = None, explain: bool = False) -> Dict[str, Any]:
         """Process natural language query and return results.
         Flow: fetch Mem0 RBAC -> schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
         """
+        from services.registry import service_registry
+        if service_registry.active_db_type == "mongodb":
+            return self.process_mongodb_query(
+                user_query=user_query,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                user_id=user_id,
+                session_id=session_id,
+                message_id=message_id,
+                company_id=company_id,
+                background_tasks=background_tasks,
+                task_id=task_id,
+                explain=explain
+            )
+
         start_time = time.time()
 
         try:
@@ -304,15 +547,20 @@ class QueryService:
             logging.info("[STEP 3] All queries executed successfully.")
 
             # ── STEP 4: Generate explanation ────────────────────────────────────
-            logging.info("[STEP 4] Generating natural language explanation...")
-            explanation_chain = self.llm_service.create_explanation_chain()
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
-            explanation = explanation_chain.invoke({
-                "Question": user_query,
-                "schema_info": schema_context,
-                "results": str(results)
-            })
-            output_tokens += self.count_tokens(str(explanation))
+            explanation = None
+            if explain:
+                logging.info("[STEP 4] Generating natural language explanation...")
+                explanation_chain = self.llm_service.create_explanation_chain()
+                input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+                explanation_res = explanation_chain.invoke({
+                    "Question": user_query,
+                    "schema_info": schema_context,
+                    "results": str(results)
+                })
+                explanation = str(explanation_res)
+                output_tokens += self.count_tokens(explanation)
+            else:
+                logging.info("[STEP 4] Skipping natural language explanation generation as explain flag is False...")
             logging.info("--- FINISHED PROCESSING QUERY ---")
 
             # Audit successful execution in Mem0
@@ -377,10 +625,25 @@ class QueryService:
             
     async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
                           user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                          task_id: int = None):
+                          task_id: int = None, explain: bool = False):
         """Process natural language query and stream results chunk by chunk.
         Enforces schema discovery, RBAC, meta-query injection, auto-repair, explanation streaming, auditing, and persistence.
         """
+        from services.registry import service_registry
+        if service_registry.active_db_type == "mongodb":
+            class DummyRequest:
+                def __init__(self, query, max_tokens, temperature, explain, session_id):
+                    self.query = query
+                    self.max_tokens = max_tokens
+                    self.temperature = temperature
+                    self.explain = explain
+                    self.session_id = session_id
+
+            dummy_req = DummyRequest(user_query, max_tokens, temperature, explain, session_id)
+            async for chunk in self.mongodb_service.stream_query(dummy_req, self.llm_service, user_id):
+                yield chunk
+            return
+
         start_time = time.time()
         input_tokens = self.count_tokens(user_query)
         output_tokens = 0
@@ -617,24 +880,27 @@ class QueryService:
             yield json.dumps({"type": "results", "content": results}) + "\n"
 
             # 5. Explaining Results (The actual Stream)
-            yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
-            explanation_chain = self.llm_service.create_explanation_chain()
-            
-            explanation_input = {
-                "Question": user_query,
-                "schema_info": schema_context,
-                "results": str(results)
-            }
-            
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
-            
-            yield json.dumps({"type": "explanation_start"}) + "\n"
             full_explanation = ""
-            async for chunk in explanation_chain.astream(explanation_input):
-                full_explanation += chunk
-                yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
-            
-            output_tokens += self.count_tokens(full_explanation)
+            if explain:
+                yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
+                explanation_chain = self.llm_service.create_explanation_chain()
+                
+                explanation_input = {
+                    "Question": user_query,
+                    "schema_info": schema_context,
+                    "results": str(results)
+                }
+                
+                input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+                
+                yield json.dumps({"type": "explanation_start"}) + "\n"
+                async for chunk in explanation_chain.astream(explanation_input):
+                    full_explanation += chunk
+                    yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
+                
+                output_tokens += self.count_tokens(full_explanation)
+            else:
+                logging.info("[STREAM] Skipping natural language explanation generation as explain flag is False...")
             
             # Audit successful execution in Mem0
             if self.mem0_service:

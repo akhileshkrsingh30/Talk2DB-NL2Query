@@ -30,6 +30,25 @@ class MongoDBService:
             self.current_database = settings.mongo_db_name
             self.current_collection = "query_results"
             self.connected = True
+            
+            # Populate connection_params from settings
+            import re
+            host = "localhost"
+            port = 27017
+            if settings.mongo_uri:
+                match = re.search(r'mongodb://([^:/]+)(?::(\d+))?', settings.mongo_uri)
+                if match:
+                    host = match.group(1)
+                    if match.group(2):
+                        port = int(match.group(2))
+            
+            self.connection_params = {
+                "host": host,
+                "port": str(port),
+                "database": settings.mongo_db_name,
+                "username": "",
+                "auth_source": "admin"
+            }
             print(f"Auto-connected to MongoDB: {settings.mongo_uri} (database: {settings.mongo_db_name})")
         except Exception as e:
             print(f"Failed to auto-connect to MongoDB: {e}")
@@ -217,7 +236,7 @@ class MongoDBService:
             raise RuntimeError("MongoDB not connected or no database selected")
         
         if self.collection is None or not self.current_collection:
-            raise RuntimeError("No collection selected. Use /mongodb/select-collection first.")
+            raise RuntimeError("No collection selected. Select a collection first using POST /database/select.")
         
         try:
             # Sample up to 10 documents to infer schema
@@ -289,6 +308,102 @@ class MongoDBService:
         start_time = time.time()
         
         try:
+            if not self.current_collection:
+                # Try to auto-select collection based on user query or allowed list
+                try:
+                    collections = self.get_collections()
+                    allowed_collections = collections
+                    
+                    # Check user/task permissions if available
+                    from services.registry import service_registry
+                    mem0_svc = service_registry.get_mem0_service()
+                    task_id = getattr(query_request, "task_id", None)
+                    if mem0_svc:
+                        permissions = {"role": "standard", "allowed_tables": ["*"]}
+                        if user_id:
+                            try:
+                                permissions = mem0_svc.get_user_permissions(user_id)
+                            except Exception:
+                                pass
+                        if task_id:
+                            try:
+                                memories = mem0_svc.client.get_all(filters={"user_id": "global"})
+                                for m in memories:
+                                    meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
+                                    if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
+                                        raw_tables = meta.get("tables", "[]")
+                                        task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
+                                        if task_tables:
+                                            allowed_collections = [c for c in collections if c.lower() in [t.lower() for t in task_tables]]
+                                        break
+                            except Exception:
+                                pass
+                    
+                    matched_col = None
+                    import re
+                    for col in allowed_collections:
+                        if re.search(r'\b' + re.escape(col) + r'\b', query_request.query, re.IGNORECASE):
+                            matched_col = col
+                            break
+                    
+                    if matched_col:
+                        self.select_collection(matched_col)
+                    elif len(allowed_collections) == 1:
+                        self.select_collection(allowed_collections[0])
+                    elif len(allowed_collections) > 1:
+                        # LLM assisted selection
+                        selector_prompt = f"""Given the user query: "{query_request.query}"
+And the list of available MongoDB collections: {allowed_collections}
+
+Which collection is the query asking about?
+If the query is a general question about the database, its schema, or doesn't target any specific collection, return "None".
+Otherwise, return the exact name of the collection from the list. Do not include any other text, quotes, or formatting.
+"""
+                        llm = llm_service.get_llm()
+                        response = llm.invoke(selector_prompt)
+                        choice = response.content.strip().replace('"', '').replace("'", "")
+                        if choice in allowed_collections:
+                            self.select_collection(choice)
+                except Exception as auto_err:
+                    pass
+
+            if not self.current_collection:
+                # Check if it is a general database/metadata query
+                is_metadata_query = any(word in query_request.query.lower() for word in [
+                    "what is data about", "database about", "about the database", 
+                    "what data", "show collections", "list collections", "what is in",
+                    "explain database", "overview", "what collections"
+                ])
+                if is_metadata_query:
+                    yield json.dumps({"type": "status", "content": "Generating database overview..."}) + "\n"
+                    collections = self.get_collections()
+                    explanation_prompt = f"""The user is asking a general question about a MongoDB database.
+Database: {self.current_database}
+Available collections: {collections}
+
+User Question: {query_request.query}
+
+Provide a helpful, professional overview of the database and what collections it contains, explaining what they represent if their names suggest it.
+"""
+                    llm = llm_service.get_llm()
+                    ans = llm.invoke(explanation_prompt)
+                    
+                    yield json.dumps({"type": "mongo_query", "content": {"action": "list_collections"}}) + "\n"
+                    yield json.dumps({"type": "results", "content": [{"collections": collections}], "count": 1}) + "\n"
+                    yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
+                    yield json.dumps({"type": "explanation_start"}) + "\n"
+                    yield json.dumps({"type": "explanation_chunk", "content": ans.content.strip()}) + "\n"
+                    
+                    execution_time = time.time() - start_time
+                    yield json.dumps({
+                        "type": "metadata", 
+                        "execution_time": execution_time,
+                        "timestamp": datetime.now().isoformat()
+                    }) + "\n"
+                    return
+                else:
+                    raise ValueError("No collection selected. Select a collection first using POST /database/select.")
+
             yield json.dumps({"type": "status", "content": "Analyzing collection schema..."}) + "\n"
             schema_description = self.get_schema_description()
             
@@ -320,18 +435,19 @@ class MongoDBService:
             yield json.dumps({"type": "results", "content": results, "count": len(results)}) + "\n"
 
             # 3. Stream Explanation
-            yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
-            explanation_chain = llm_service.create_mongodb_explanation_chain()
-            
-            explanation_input = {
-                "Question": query_request.query,
-                "schema_info": schema_description,
-                "results": str(results[:20]) # Limit to avoid token overflow
-            }
-            
-            yield json.dumps({"type": "explanation_start"}) + "\n"
-            async for chunk in explanation_chain.astream(explanation_input):
-                yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
+            if getattr(query_request, "explain", False):
+                yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
+                explanation_chain = llm_service.create_mongodb_explanation_chain()
+                
+                explanation_input = {
+                    "Question": query_request.query,
+                    "schema_info": schema_description,
+                    "results": str(results[:20]) # Limit to avoid token overflow
+                }
+                
+                yield json.dumps({"type": "explanation_start"}) + "\n"
+                async for chunk in explanation_chain.astream(explanation_input):
+                    yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
             
             execution_time = time.time() - start_time
             yield json.dumps({

@@ -29,72 +29,7 @@ def get_mongodb_service() -> MongoDBService:
     """Dependency to get MongoDB service instance"""
     return service_registry.get_mongodb_service()
 
-@router.post("/connect", response_model=MongoDBConnectionResponse, responses={400: {"model": ErrorResponse}})
-async def connect_to_mongodb(
-    connection: MongoDBConnection,
-    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
-    current_user: Annotated[str, Depends(verify_token)]
-):
-    """Connect to a MongoDB server"""
-    try:
-        # Log the incoming connection request (without password)
-        print(f"MongoDB connection request - Host: {connection.host}, Port: {connection.port}, "
-              f"Database: {connection.database}, Username: {connection.username}")
-        
-        connection_params = {
-            "host": connection.host,
-            "port": connection.port,
-            "database": connection.database,
-            "username": connection.username,
-            "password": connection.password,
-            "auth_source": connection.auth_source,
-            "auth_mechanism": connection.auth_mechanism
-        }
-        
-        success = mongodb_service.connect(connection_params)
-        
-        if success:
-            server_info = mongodb_service.get_server_info()
-            params = mongodb_service.get_connection_params()
-            
-            return MongoDBConnectionResponse(
-                status="success",
-                message="Connected to MongoDB successfully",
-                server_info=server_info,
-                details={
-                    "host": connection.host,
-                    "port": connection.port,
-                    "database": params.get("database", "admin"),
-                    "username": connection.username or "none"
-                }
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to connect to MongoDB"
-            )
-            
-    except ValueError as e:
-        # Validation errors (missing fields, invalid port, etc.)
-        print(f"Validation error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Validation error: {str(e)}"
-        )
-    except ConnectionError as e:
-        # MongoDB connection errors
-        print(f"Connection error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Connection error: {str(e)}"
-        )
-    except Exception as e:
-        # Other unexpected errors
-        print(f"Unexpected error during MongoDB connection: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error: {str(e)}"
-        )
+
 
 @router.post("/disconnect", response_model=dict)
 async def disconnect_mongodb(
@@ -458,21 +393,23 @@ async def process_mongodb_query(
         print(f"✓ Query returned {len(results)} results")
         
         # Generate explanation
-        explanation_chain = llm_service.create_mongodb_explanation_chain()
-        
-        # Limit results sent to LLM for explanation to avoid token overflow
-        results_for_explanation = results[:20] if len(results) > 20 else results
-        
-        input_tokens += count_tokens(query_request.query) + count_tokens(schema_description)
-        
-        explanation = explanation_chain.invoke({
-            "Question": query_request.query,
-            "schema_info": schema_description,
-            "results": str(results_for_explanation)
-        })
-        
-        output_tokens += count_tokens(str(explanation))
-        print("✓ Generated explanation")
+        explanation = None
+        if query_request.explain is not False:
+            explanation_chain = llm_service.create_mongodb_explanation_chain()
+            
+            # Limit results sent to LLM for explanation to avoid token overflow
+            results_for_explanation = results[:20] if len(results) > 20 else results
+            
+            input_tokens += count_tokens(query_request.query) + count_tokens(schema_description)
+            
+            explanation = explanation_chain.invoke({
+                "Question": query_request.query,
+                "schema_info": schema_description,
+                "results": str(results_for_explanation)
+            })
+            
+            output_tokens += count_tokens(str(explanation))
+            print("✓ Generated explanation")
         
         execution_time = time.time() - start_time
         

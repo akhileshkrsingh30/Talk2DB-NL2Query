@@ -17,6 +17,11 @@ class ServiceRegistry:
         self._billing_service: Optional[BillingService] = None
         self._mongodb_service: Optional[MongoDBService] = None
         self._mem0_service: Optional[Mem0Service] = None
+        
+        # Track which database type is currently active ("sql" or "mongodb")
+        from config import settings
+        db_t = (settings.db_type or "").lower()
+        self.active_db_type: str = "mongodb" if db_t == "mongodb" else "sql"
     
     def set_db_service(self, service: DatabaseService):
         self._db_service = service

@@ -27,7 +27,6 @@ class Settings(BaseSettings):
     db_password: str = Field("", env="DB_PASSWORD")
     
     # LLM configuration
-    krutim_cloud_api_key: str = Field("", env="KRUTIM_CLOUD_API_KEY")
     openai_api_key: str = Field("", env="OPENAI_API_KEY")
     openai_api_base: str = Field("", env="OPENAI_API_BASE")
     llm_model_name: str = Field("gpt-5.2", env="LLM_MODEL_NAME")
@@ -70,7 +69,6 @@ class Settings(BaseSettings):
         print(f"   DB_HOST: {self.db_host}")
         print(f"   DB_NAME: {self.db_name}")
         print(f"   DB_USER: {self.db_user}")
-        print(f"   KRUTIM_CLOUD_API_KEY: {self.krutim_cloud_api_key[:10]}..." if self.krutim_cloud_api_key else "   KRUTIM_CLOUD_API_KEY: (not set)")
         print(f"   OPENAI_API_KEY: {self.openai_api_key[:10]}..." if self.openai_api_key else "   OPENAI_API_KEY: (not set)")
         print(f"   OPENAI_API_BASE: {self.openai_api_base}")
         print(f"   MODEL_NAME: {self.llm_model_name}")

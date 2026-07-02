@@ -19,8 +19,7 @@ def get_db_service() -> DatabaseService:
     """Dependency to get database service instance"""
     try:
         service = service_registry.get_db_service()
-        # If not connected, try to auto-connect using environment settings
-        if not service.is_connected():
+        if not service.is_connected() and service_registry.active_db_type != "mongodb":
             if all([settings.db_host, settings.db_port, settings.db_user, settings.db_password]):
                 try:
                     service.connect({
@@ -46,7 +45,7 @@ def get_llm_service() -> LLMService:
         service = service_registry.get_llm_service()
         # Proactive auto-configuration if not already configured
         if not service.is_configured():
-            api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY")
+            api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
             if api_key and api_key.strip():
                 try:
                     service.configure(

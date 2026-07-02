@@ -5,13 +5,16 @@ from datetime import datetime
 class DatabaseConnection(BaseModel):
     host: str = Field(..., description="Database host address")
     port: str = Field(..., description="Database port")
-    database: Optional[str] = Field(None, description="Database name (optional, defaults to 'postgres' if not provided)")
-    user: str = Field(..., description="Database username")
-    password: str = Field(..., description="Database password")
-    db_type: Optional[str] = Field("postgresql", description="Database type (postgresql, mysql, mariadb, mssql, oracle)")
+    database: Optional[str] = Field(None, description="Database name (optional)")
+    user: Optional[str] = Field(None, description="Database username")
+    password: Optional[str] = Field(None, description="Database password")
+    db_type: Optional[str] = Field("postgresql", description="Database type (postgresql, mysql, mariadb, mssql, oracle, mongodb)")
+    auth_source: Optional[str] = Field("admin", description="MongoDB authentication database (default: admin)")
+    auth_mechanism: Optional[str] = Field(None, description="MongoDB authentication mechanism (optional)")
 
 class DatabaseSelect(BaseModel):
-    database: str = Field(..., description="Database name to switch to")
+    database: Optional[str] = Field(None, description="Database name to switch to")
+    collection: Optional[str] = Field(None, description="Collection name to switch to (MongoDB only)")
 
 class ConnectionResponse(BaseModel):
     status: str = Field(..., description="Connection status")
@@ -30,6 +33,7 @@ class QueryRequest(BaseModel):
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
     task_id: Optional[int] = Field(None, description="Optional task ID to restrict query execution to the tables mapped to this task")
+    explain: Optional[bool] = Field(False, description="Whether to generate a natural language explanation of results")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")
@@ -40,9 +44,10 @@ class QueryResult(BaseModel):
     message_id: str = Field(..., description="Unique message identifier")
     company_id: str = Field(..., description="Unique company identifier")
     query: str = Field(..., description="Original natural language query")
-    sql_queries: List[SQLQuery] = Field(..., description="Generated SQL queries")
+    sql_queries: Optional[List[SQLQuery]] = Field(None, description="Generated SQL queries")
+    mongo_query: Optional[Dict[str, Any]] = Field(None, description="Generated MongoDB query")
     results: List[Union[List[Dict[str, Any]], Dict[str, Any]]] = Field(..., description="Query execution results")
-    explanation: str = Field(..., description="Natural language explanation of results")
+    explanation: Optional[str] = Field(None, description="Natural language explanation of results")
     timestamp: datetime = Field(..., description="When the query was executed")
     execution_time: Optional[float] = Field(None, description="Execution time in seconds")
     input_tokens: Optional[int] = Field(None, description="Number of input tokens")
@@ -164,13 +169,14 @@ class MongoDBQueryRequest(BaseModel):
     max_tokens: Optional[int] = Field(1024, description="Maximum tokens for LLM response")
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     session_id: Optional[str] = Field(None, description="Optional session identifier")
+    explain: Optional[bool] = Field(False, description="Whether to return a natural language explanation alongside the results")
 
 class MongoDBQueryResult(BaseModel):
     query: str = Field(..., description="Original natural language query")
     mongo_query: Dict[str, Any] = Field(..., description="Generated MongoDB query")
     results: List[Dict[str, Any]] = Field(..., description="Query execution results")
     result_count: int = Field(..., description="Number of results returned")
-    explanation: str = Field(..., description="Natural language explanation of results")
+    explanation: Optional[str] = Field(None, description="Natural language explanation of results")
     collection: str = Field(..., description="Collection queried")
     database: str = Field(..., description="Database queried")
     timestamp: datetime = Field(..., description="When the query was executed")

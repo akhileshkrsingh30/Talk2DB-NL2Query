@@ -35,26 +35,79 @@ async def connect_to_database(
         print(f"Connection request - Host: {connection.host}, Port: {connection.port}, "
               f"Database: {connection.database}, User: {connection.user}")
         
+        db_type = connection.db_type or settings.db_type
+        if db_type and db_type.lower() == "mongodb":
+            # Disconnect SQL DB first
+            db_service.disconnect()
+            
+            connection_params = {
+                "host": connection.host,
+                "port": connection.port,
+                "database": connection.database,
+                "username": connection.user,
+                "password": connection.password,
+                "auth_source": connection.auth_source or "admin",
+                "auth_mechanism": connection.auth_mechanism
+            }
+            success = mongodb_service.connect(connection_params)
+            
+            if success:
+                from services.registry import service_registry
+                service_registry.active_db_type = "mongodb"
+                
+                if not llm_service.is_configured():
+                    api_key = settings.openai_api_key
+                    if api_key and api_key.strip():
+                        try:
+                            llm_service.configure(
+                                api_key=api_key,
+                                base_url=settings.openai_api_base or None,
+                                model=settings.llm_model_name,
+                                validate_key=False
+                            )
+                        except Exception as e:
+                            print(f"Automatic LLM configuration failed during MongoDB connect: {e}")
+                
+                server_info = mongodb_service.get_server_info()
+                return ConnectionResponse(
+                    status="success",
+                    message="Connected to MongoDB database successfully (and LLM configured)",
+                    version=server_info.get("version") if server_info else None,
+                    details={
+                        "host": connection.host,
+                        "database": connection.database or "admin",
+                        "user": connection.user or "none"
+                    }
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Failed to connect to MongoDB"
+                )
+
         connection_params = {
             "host": connection.host,
             "port": connection.port,
             "database": connection.database,
             "user": connection.user,
             "password": connection.password,
-            "db_type": connection.db_type or settings.db_type
+            "db_type": db_type
         }
         
         success = db_service.connect(connection_params)
         
         if success:
+            from services.registry import service_registry
+            service_registry.active_db_type = "sql"
+            
             # When database connects, also ensure LLM is configured if it isn't already
             if not llm_service.is_configured():
-                api_key = settings.krutim_cloud_api_key or settings.openai_api_key
+                api_key = settings.openai_api_key
                 if api_key and api_key.strip():
                     try:
                         llm_service.configure(
                             api_key=api_key,
-                            base_url=settings.openai_api_base or (None if settings.openai_api_key else "https://api.krutim.ai/v1"),
+                            base_url=settings.openai_api_base or None,
                             model=settings.llm_model_name,
                             validate_key=False
                         )
@@ -76,7 +129,7 @@ async def connect_to_database(
                 details={
                     "host": connection.host,
                     "database": connection.database or "postgres",
-                    "user": connection.user
+                    "user": connection.user or "none"
                 }
             )
         else:
@@ -110,34 +163,48 @@ async def connect_to_database(
 @router.post("/disconnect", response_model=dict)
 async def disconnect_database(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Disconnect from database"""
     db_service.disconnect()
+    mongodb_service.disconnect()
     return {"message": "Disconnected from database"}
 
 @router.get("/list", response_model=Dict[str, Any])
 async def list_databases(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """List all databases available on the server"""
     try:
-        # Check if connected first
-        if not db_service.is_connected():
-            print("Error: Attempted to list databases without being connected")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database not connected. Please connect first using /database/connect endpoint (you can omit the 'database' field to connect to the default 'postgres' database)."
-            )
-        
-        databases = db_service.get_databases()
-        print(f"Successfully listed {len(databases)} databases")
-        return {
-            "status": "success",
-            "databases": databases,
-            "count": len(databases)
-        }
+        from services.registry import service_registry
+        if service_registry.active_db_type == "mongodb":
+            if not mongodb_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="MongoDB not connected."
+                )
+            databases = mongodb_service.get_databases()
+            return {
+                "status": "success",
+                "databases": databases,
+                "count": len(databases)
+            }
+        else:
+            if not db_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Database not connected. Please connect first using /database/connect endpoint."
+                )
+            databases = db_service.get_databases()
+            print(f"Successfully listed {len(databases)} databases")
+            return {
+                "status": "success",
+                "databases": databases,
+                "count": len(databases)
+            }
     except HTTPException:
         raise
     except RuntimeError as e:
@@ -162,33 +229,92 @@ async def select_database(
 ):
     """Switch to a specific database after listing them"""
     try:
-        success = db_service.select_database(selection.database)
-        if success:
-            # NEW: Push schema to MongoDB on successful selection
-            try:
-                schema_dict = db_service.get_schema_dict()
-                mongodb_service.push_postgres_schema(schema_dict)
-            except Exception as e:
-                print(f"Failed to auto-push schema to MongoDB: {e}")
+        from services.registry import service_registry
+        if service_registry.active_db_type == "mongodb":
+            if not mongodb_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="MongoDB database not connected."
+                )
+            msg_parts = []
+            if selection.database:
+                success = mongodb_service.select_database(selection.database)
+                if not success:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Failed to switch to database '{selection.database}'"
+                    )
+                msg_parts.append(f"database '{selection.database}'")
+            if selection.collection:
+                success = mongodb_service.select_collection(selection.collection)
+                if not success:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Failed to switch to collection '{selection.collection}'"
+                    )
+                msg_parts.append(f"collection '{selection.collection}'")
+            
+            if not msg_parts:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Please provide database or collection to select."
+                )
 
-
-            params = db_service.get_connection_params()
+            params = mongodb_service.get_connection_params() or {}
+            server_info = mongodb_service.get_server_info()
             return ConnectionResponse(
                 status="success",
-                message=f"Switched to database '{selection.database}' successfully",
-                version=db_service.get_db_version(),
+                message=f"Switched to {' and '.join(msg_parts)} successfully",
+                version=server_info.get("version") if server_info else None,
                 details={
-                    "host": params["host"],
-                    "database": params["database"],
-                    "user": params["user"]
+                    "host": str(params.get("host") or "none"),
+                    "database": str(mongodb_service.current_database or "none"),
+                    "collection": str(mongodb_service.current_collection or "none"),
+                    "user": str(params.get("username") or "none")
                 }
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to switch to database '{selection.database}'"
-            )
+            if not db_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Database not connected. Please connect first using /database/connect endpoint."
+                )
+            if not selection.database:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Database name is required."
+                )
+
+            success = db_service.select_database(selection.database)
+            if success:
+                # NEW: Push schema to MongoDB on successful selection
+                try:
+                    schema_dict = db_service.get_schema_dict()
+                    mongodb_service.push_postgres_schema(schema_dict)
+                except Exception as e:
+                    print(f"Failed to auto-push schema to MongoDB: {e}")
+
+                params = db_service.get_connection_params()
+                return ConnectionResponse(
+                    status="success",
+                    message=f"Switched to database '{selection.database}' successfully",
+                    version=db_service.get_db_version(),
+                    details={
+                        "host": str(params.get("host") or "none"),
+                        "database": str(params.get("database") or "none"),
+                        "user": str(params.get("user") or "none")
+                    }
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to switch to database '{selection.database}'"
+                )
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)
@@ -197,18 +323,36 @@ async def select_database(
 @router.get("/schema", response_model=DatabaseSchema, responses={400: {"model": ErrorResponse}})
 async def get_database_schema(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Get database schema information"""
     try:
-        if not db_service.is_connected():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database not connected"
-            )
-        
-        schema_info = db_service.get_simplified_schema()
-        return DatabaseSchema(schema_info=schema_info)
+        from services.registry import service_registry
+        if service_registry.active_db_type == "mongodb":
+            if not mongodb_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="MongoDB database not connected."
+                )
+            if not mongodb_service.current_collection:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No collection selected. Select a collection first."
+                )
+            schema_info = mongodb_service.get_schema_description()
+            return DatabaseSchema(schema_info=schema_info)
+        else:
+            if not db_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Database not connected"
+                )
+            
+            schema_info = db_service.get_simplified_schema()
+            return DatabaseSchema(schema_info=schema_info)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -218,44 +362,83 @@ async def get_database_schema(
 @router.get("/status", response_model=ConnectionResponse)
 async def get_database_status(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)]
 ):
     """Get current database connection status"""
-    if db_service.is_connected():
-        params = db_service.get_connection_params()
-        return ConnectionResponse(
-            status="connected",
-            message="Database is connected",
-            version=db_service.get_db_version(),
-            details={
-                "host": params["host"],
-                "port": params["port"],
-                "database": params["database"],
-                "user": params["user"]
-            } if params else None
-        )
+    from services.registry import service_registry
+    if service_registry.active_db_type == "sql":
+        if db_service.is_connected():
+            params = db_service.get_connection_params()
+            return ConnectionResponse(
+                status="connected",
+                message="Database is connected",
+                version=db_service.get_db_version(),
+                details={
+                    "host": str(params.get("host") or "none"),
+                    "port": str(params.get("port") or "none"),
+                    "database": str(params.get("database") or "none"),
+                    "user": str(params.get("user") or "none")
+                } if params else None
+            )
+        else:
+            return ConnectionResponse(
+                status="disconnected",
+                message=f"Database is not connected. (Configured for {settings.db_host or 'none'})"
+            )
     else:
-        return ConnectionResponse(
-            status="disconnected",
-            message=f"Database is not connected. (Configured for {settings.db_host or 'none'})"
-        )
+        if mongodb_service.is_connected():
+            params = mongodb_service.get_connection_params()
+            server_info = mongodb_service.get_server_info()
+            return ConnectionResponse(
+                status="connected",
+                message="MongoDB is connected",
+                version=server_info.get("version") if server_info else None,
+                details={
+                    "host": str(params.get("host") or "none"),
+                    "port": str(params.get("port") or "none"),
+                    "database": str(mongodb_service.current_database or "none"),
+                    "user": str(params.get("username") or "none")
+                } if params else None
+            )
+        else:
+            return ConnectionResponse(
+                status="disconnected",
+                message="MongoDB database is not connected."
+            )
 
 @router.get("/tables", response_model=Dict[str, Any], responses={400: {"model": ErrorResponse}})
 async def list_tables(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     current_user: Annotated[str, Depends(verify_token)],
     task_id: Optional[int] = None,
     mem0_service: Annotated[Any, Depends(get_mem0_service)] = None
 ):
-    """List all tables in the currently connected database (filtered by active permissions)"""
+    """List all tables or collections in the currently connected database"""
     try:
-        if not db_service.is_connected():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Database not connected. Please connect first using /database/connect endpoint."
-            )
-        
-        tables = db_service.get_tables()
+        from services.registry import service_registry
+        if service_registry.active_db_type == "mongodb":
+            if not mongodb_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="MongoDB database not connected."
+                )
+            collections = mongodb_service.get_collections()
+            return {
+                "status": "success",
+                "database": mongodb_service.current_database,
+                "tables": collections,
+                "count": len(collections)
+            }
+        else:
+            if not db_service.is_connected():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Database not connected. Please connect first using /database/connect endpoint."
+                )
+            
+            tables = db_service.get_tables()
         
         # Resolve permissions
         permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
@@ -374,7 +557,7 @@ async def configure_llm(
         llm_service.reset_configuration()
         
         # Use provided value or fall back to settings
-        api_key = config.api_key or settings.krutim_cloud_api_key or settings.openai_api_key
+        api_key = config.api_key or settings.openai_api_key
         api_base = config.api_base or settings.openai_api_base
         model = config.model or settings.llm_model_name
         
@@ -553,6 +736,7 @@ async def execute_sql_batch(
 async def get_table_data(
     table_name: str,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    mongodb_service: Annotated[MongoDBService, Depends(get_mongodb_service)],
     mem0_service: Annotated[Any, Depends(get_mem0_service)],
     current_user: Annotated[str, Depends(verify_token)],
     limit: int = 100,
@@ -560,8 +744,28 @@ async def get_table_data(
     task_id: Optional[str] = None
 ):
     """
-    Fetch records/data from a specific database table, subject to RBAC and optional task limits.
+    Fetch records/data from a specific database table or MongoDB collection.
     """
+    if mongodb_service.is_connected():
+        try:
+            db = mongodb_service.client[mongodb_service.current_database]
+            col = db[table_name]
+            cursor = col.find({}, {"_id": 0}).skip(offset).limit(limit)
+            data = list(cursor)
+            return {
+                "status": "success",
+                "table": table_name,
+                "count": len(data),
+                "limit": limit,
+                "offset": offset,
+                "data": data
+            }
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to fetch MongoDB data: {str(e)}"
+            )
+
     if not db_service.is_connected():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

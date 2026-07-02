@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from config import settings
-from routers import database, queries, sharing, llm_config, mongodb, rbac, memories
+from routers import database, queries, sharing, llm_config, rbac, memories
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
@@ -77,10 +77,8 @@ async def lifespan(app: FastAPI):
             print(f"Database auto-connection failed: {e}")
 
     # Try to configure LLM from environment variables
-    # Use Krutim if key is provided, otherwise fallback to OpenAI
-    # Try settings first, then direct os.environ fallback
     import os
-    api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY") or os.getenv("KRUTIM_CLOUD_API_KEY")
+    api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
     
     if api_key and api_key.strip():
         try:
@@ -88,7 +86,7 @@ async def lifespan(app: FastAPI):
             # Use direct configuration to avoid the overhead/latency of the test-ping during startup
             llm_service.configure(
                 api_key=api_key,
-                base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE") or (None if (settings.openai_api_key or os.getenv("OPENAI_API_KEY")) else "https://api.krutim.ai/v1"),
+                base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE"),
                 model=settings.llm_model_name,
                 validate_key=False  # Bypass validation for instant startup
             )
@@ -96,7 +94,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"✗ LLM auto-configuration failed: {e}")
     else:
-        print("✗ No LLM API key found in environment variables or .env file.")
+        print("✗ No OpenAI API key found in environment variables or .env file.")
     
     print("Services initialized successfully")
     yield
@@ -124,7 +122,6 @@ app.add_middleware(
 
 # Include routers with token verification
 app.include_router(database.router, dependencies=[Depends(verify_token)])
-app.include_router(mongodb.router, dependencies=[Depends(verify_token)])
 app.include_router(queries.router, dependencies=[Depends(verify_token)])
 app.include_router(sharing.router, dependencies=[Depends(verify_token)])
 app.include_router(llm_config.router, dependencies=[Depends(verify_token)])
