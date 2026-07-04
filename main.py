@@ -7,6 +7,7 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+
 # Configure logging EARLY (before any other imports that may call logging)
 # Direct all logs to stdout so they appear alongside print() in the terminal
 logging.basicConfig(
@@ -110,6 +111,14 @@ app = FastAPI(
     version=settings.app_version,
     lifespan=lifespan
 )
+
+# Instrument the app and expose /metrics endpoint if prometheus-fastapi-instrumentator is installed
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app).expose(app)
+    print("✓ Prometheus metrics instrumentation enabled")
+except ImportError:
+    print("⚠ prometheus-fastapi-instrumentator not installed; monitoring is disabled")
 
 # Add CORS middleware
 app.add_middleware(

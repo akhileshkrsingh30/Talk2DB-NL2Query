@@ -11,7 +11,7 @@ router = APIRouter(prefix="/memories", tags=["memories"])
 
 def delete_task_points_from_db(task_id: str, mem0_service: Mem0Service) -> int:
     """
-    Deletes any existing memory entries matching task_id (or lask_id typo)
+    Deletes any existing memory entries matching task_id
     using direct Qdrant client to scroll all points, filtering in Python,
     and deleting matching points by ID.
     Returns the count of deleted items.
@@ -56,8 +56,8 @@ def delete_task_points_from_db(task_id: str, mem0_service: Mem0Service) -> int:
                         except Exception:
                             meta = payload
                             
-                    # Retrieve task_id / lask_id from either the payload or the metadata dictionary
-                    m_task_id = payload.get("task_id") or payload.get("lask_id") or meta.get("task_id") or meta.get("lask_id")
+                    # Retrieve task_id from either the payload or the metadata dictionary
+                    m_task_id = payload.get("task_id") or meta.get("task_id")
                     
                     if m_task_id is not None and str(m_task_id) == str(task_id):
                         points_to_delete.append(p.id)
@@ -95,7 +95,7 @@ def delete_task_points_from_db(task_id: str, mem0_service: Mem0Service) -> int:
                     pass
                     
             if meta and isinstance(meta, dict):
-                m_task_id = meta.get("task_id") or meta.get("lask_id")
+                m_task_id = meta.get("task_id")
                 if str(m_task_id) == str(task_id):
                     memory_id = m.get("id") if isinstance(m, dict) else getattr(m, "id", None)
                     if memory_id:
@@ -300,7 +300,21 @@ async def get_all_mem0_data(
         if not exists:
             # Fall back to Mem0 client get_all for common keys
             results = []
-            for uid in ["global", "jetly.2492@gmail.com", "anurag.priyadarshi@softelnetworks.com", "jyoti.raut@softelnetworks.com"]:
+            uids = ["global", settings.auth_default_user]
+            try:
+                from services.registry import service_registry
+                db_service = service_registry.get_db_service()
+                if db_service and db_service.is_connected():
+                    user_rows = db_service.execute_query("SELECT Email FROM AppUsers WHERE IsActive = 1")
+                    if user_rows and isinstance(user_rows, list):
+                        for row in user_rows:
+                            email = row.get("Email")
+                            if email and email not in uids:
+                                uids.append(email)
+            except Exception as db_err:
+                logging.warning(f"Failed to fetch user emails from DB: {db_err}")
+                
+            for uid in uids:
                 try:
                     mems = mem0_service.client.get_all(filters={"user_id": uid})
                     results.extend(mems)
@@ -358,7 +372,21 @@ async def get_all_mem0_data(
         # Fallback to client get_all if direct DB fails
         try:
             results = []
-            for uid in ["global", "jetly.2492@gmail.com", "anurag.priyadarshi@softelnetworks.com", "jyoti.raut@softelnetworks.com"]:
+            uids = ["global", settings.auth_default_user]
+            try:
+                from services.registry import service_registry
+                db_service = service_registry.get_db_service()
+                if db_service and db_service.is_connected():
+                    user_rows = db_service.execute_query("SELECT Email FROM AppUsers WHERE IsActive = 1")
+                    if user_rows and isinstance(user_rows, list):
+                        for row in user_rows:
+                            email = row.get("Email")
+                            if email and email not in uids:
+                                uids.append(email)
+            except Exception as db_err:
+                logging.warning(f"Failed to fetch user emails from DB in exception handler: {db_err}")
+                
+            for uid in uids:
                 mems = mem0_service.client.get_all(filters={"user_id": uid})
                 results.extend(mems)
             mems = mem0_service.client.get_all(filters={"agent_id": "global_rbac"})

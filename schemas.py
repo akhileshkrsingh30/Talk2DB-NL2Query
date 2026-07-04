@@ -33,7 +33,7 @@ class QueryRequest(BaseModel):
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
     task_id: Optional[int] = Field(None, description="Optional task ID to restrict query execution to the tables mapped to this task")
-    explain: Optional[bool] = Field(False, description="Whether to generate a natural language explanation of results")
+    explain: Optional[bool] = Field(True, description="Whether to generate a natural language explanation of results")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")
@@ -169,7 +169,7 @@ class MongoDBQueryRequest(BaseModel):
     max_tokens: Optional[int] = Field(1024, description="Maximum tokens for LLM response")
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     session_id: Optional[str] = Field(None, description="Optional session identifier")
-    explain: Optional[bool] = Field(False, description="Whether to return a natural language explanation alongside the results")
+    explain: Optional[bool] = Field(True, description="Whether to return a natural language explanation alongside the results")
 
 class MongoDBQueryResult(BaseModel):
     query: str = Field(..., description="Original natural language query")

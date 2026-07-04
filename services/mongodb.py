@@ -435,7 +435,7 @@ Provide a helpful, professional overview of the database and what collections it
             yield json.dumps({"type": "results", "content": results, "count": len(results)}) + "\n"
 
             # 3. Stream Explanation
-            if getattr(query_request, "explain", False):
+            if getattr(query_request, "explain", True):
                 yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
                 explanation_chain = llm_service.create_mongodb_explanation_chain()
                 

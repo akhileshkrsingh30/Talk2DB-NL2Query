@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     
     # Auth configuration
     auth_api_url: str = Field("http://10.199.207.78:8080/jwt-0.0.1-SNAPSHOT/api/protected", env="AUTH_API_URL")
+    auth_default_user: str = Field("jetly.2492@gmail.com", env="AUTH_DEFAULT_USER")
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

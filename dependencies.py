@@ -159,9 +159,9 @@ def verify_token(authorization: Annotated[Optional[str], Header()] = None) -> st
     """
     Authentication removed/bypassed. 
     Attempts to extract identity from the authorization header if provided,
-    otherwise falls back to the default administrator 'jetly.2492@gmail.com'.
+    otherwise falls back to the configured default administrator.
     """
-    default_user = "jetly.2492@gmail.com"
+    default_user = settings.auth_default_user
     
     if not authorization:
         return default_user

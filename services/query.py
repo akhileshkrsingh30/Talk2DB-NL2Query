@@ -46,9 +46,8 @@ class QueryService:
         
     def process_mongodb_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                               user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                              background_tasks: Any = None, task_id: int = None, explain: bool = False) -> Dict[str, Any]:
+                              background_tasks: Any = None, task_id: int = None) -> Dict[str, Any]:
         """Process natural language query for MongoDB and return results."""
-        print(f"[DEBUG] process_mongodb_query called with explain={explain}")
         start_time = time.time()
         logging.info(f"--- START PROCESSING MONGODB QUERY: '{user_query[:80]}' ---")
 
@@ -274,7 +273,7 @@ Provide a helpful, professional overview of the database and what collections it
 
     def process_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                       user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                      background_tasks: Any = None, task_id: int = None, explain: bool = False) -> Dict[str, Any]:
+                      background_tasks: Any = None, task_id: int = None, explain: bool = True) -> Dict[str, Any]:
         """Process natural language query and return results.
         Flow: fetch Mem0 RBAC -> schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
         """
@@ -625,7 +624,7 @@ Provide a helpful, professional overview of the database and what collections it
             
     async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
                           user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                          task_id: int = None, explain: bool = False):
+                          task_id: int = None, explain: bool = True):
         """Process natural language query and stream results chunk by chunk.
         Enforces schema discovery, RBAC, meta-query injection, auto-repair, explanation streaming, auditing, and persistence.
         """
