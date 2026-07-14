@@ -51,9 +51,11 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yaml
     restart: unless-stopped
     depends_on:
       - prometheus
+
 
   loki:
     image: grafana/loki:latest
@@ -61,38 +63,32 @@ services:
     ports:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml
+      - loki_data:/loki
+    restart: unless-stopped
+  snmp-exporter:
+    image: prom/snmp-exporter:latest
+    container_name: monitoring-snmp-exporter
+    ports:
+      - "9116:9116"
     restart: unless-stopped
 
-  promtail:
-    image: grafana/promtail:latest
-    container_name: monitoring-promtail
+  telegraf:
+    image: telegraf:latest
+    container_name: monitoring-telegraf
+    ports:
+      - "162:162/udp"
     volumes:
-      - ./promtail-config.yml:/etc/promtail/config.yml
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-    command: -config.file=/etc/promtail/config.yml
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
     restart: unless-stopped
     depends_on:
       - loki
 
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    container_name: monitoring-cadvisor
-    privileged: true
-    ports:
-      - "8081:8080"
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /sys/fs/cgroup:/sys/fs/cgroup:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-      - /dev/disk/:/dev/disk:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    restart: unless-stopped
-    devices:
-      - /dev/kmsg
-
 volumes:
   pgvector_data:
   grafana_data:
+  loki_data:
+
+
+

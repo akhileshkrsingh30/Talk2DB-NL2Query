@@ -2,11 +2,21 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
-  - job_name: "fastapi-app"
-    metrics_path: "/metrics"
+  - job_name: "prometheus"
     static_configs:
-      - targets: ["api:8080"] # 'api' matches the container name in docker-compose.yml
+      - targets: ["localhost:9090"]
 
-  - job_name: "cadvisor"
+  - job_name: "snmp"
     static_configs:
-      - targets: ["cadvisor:8080"]
+      - targets:
+          - 192.168.1.1 # Replace with your actual router/switch IP
+    metrics_path: /snmp
+    params:
+      module: [if_mib]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: snmp-exporter:9116
