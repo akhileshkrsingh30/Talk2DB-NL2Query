@@ -8,7 +8,6 @@ services:
       - .env
     environment:
       - MONGO_URI=mongodb://host.docker.internal:27017/
-      - MEM0_PG_CONNECTION_STRING=postgresql://postgres:postgres@pgvector:5432/postgres
     volumes:
       - ./shared_results:/app/shared_results
     restart: unless-stopped
@@ -17,21 +16,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    depends_on:
-      - pgvector
 
-  pgvector:
-    image: pgvector/pgvector:pg16
-    container_name: mem0-pgvector
-    ports:
-      - "5432:5432"
-    environment:
-      - POSTGRES_DB=postgres
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-    volumes:
-      - pgvector_data:/var/lib/postgresql/data
-    restart: unless-stopped
-
-volumes:
-  pgvector_data:

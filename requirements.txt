@@ -22,5 +22,4 @@ aiohttp>=3.13.4
 Pygments>=2.20.0
 pymssql>=2.3.0
 oracledb>=2.0.0
-mem0ai>=0.1.0
-qdrant-client>=1.7.0
+

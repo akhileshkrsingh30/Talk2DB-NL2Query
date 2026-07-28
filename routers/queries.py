@@ -16,7 +16,6 @@ from dependencies import (
     get_sharing_service, 
     get_billing_service,
     get_mongodb_service,
-    get_mem0_service,
     verify_token
 )
 
@@ -26,11 +25,10 @@ def get_query_service(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     billing_service: Annotated[BillingService, Depends(get_billing_service)],
-    mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
-    mem0_service: Annotated[Any, Depends(get_mem0_service)]
+    mongodb_service: Annotated[Any, Depends(get_mongodb_service)]
 ) -> QueryService:
     """Get a fresh query service instance with current service states"""
-    return QueryService(db_service, llm_service, billing_service, mongodb_service, mem0_service)
+    return QueryService(db_service, llm_service, billing_service, mongodb_service)
 
 from fastapi.responses import StreamingResponse
 
@@ -116,7 +114,6 @@ async def process_natural_language_query_batch(
     llm_service: Annotated[LLMService, Depends(get_llm_service)],
     billing_service: Annotated[BillingService, Depends(get_billing_service)],
     mongodb_service: Annotated[Any, Depends(get_mongodb_service)],
-    mem0_service: Annotated[Any, Depends(get_mem0_service)],
     current_user: Annotated[str, Depends(verify_token)],
     background_tasks: BackgroundTasks
 ):
@@ -146,7 +143,7 @@ async def process_natural_language_query_batch(
             def run_item(index: int, q):
                 item_task_id = q.task_id if q.task_id is not None else batch_request.task_id
                 try:
-                    service = QueryService(db_service, llm_service, billing_service, mongodb_service, mem0_service)
+                    service = QueryService(db_service, llm_service, billing_service, mongodb_service)
                     return service.process_query(
                         user_query=q.query, 
                         max_tokens=q.max_tokens, 
@@ -186,7 +183,7 @@ async def process_natural_language_query_batch(
                     idx = future_map[future]
                     results[idx] = future.result()
         else:
-            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service, mem0_service)
+            query_service = QueryService(db_service, llm_service, billing_service, mongodb_service)
             results: List[QueryResult] = []
             for item in batch_request.queries:
                 item_task_id = item.task_id if item.task_id is not None else batch_request.task_id

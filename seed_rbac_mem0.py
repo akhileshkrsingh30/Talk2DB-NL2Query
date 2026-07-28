@@ -1,1 +1,1 @@
-# Removed: Seeding RBAC to Mem0 is no longer used.
+# Removed seed_rbac_mem0

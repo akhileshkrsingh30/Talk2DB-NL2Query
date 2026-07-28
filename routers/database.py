@@ -11,7 +11,7 @@ from schemas import DatabaseConnection, DatabaseSelect, ConnectionResponse, Data
 from services.database import DatabaseService, convert_realdict_to_dict
 from services.llm import LLMService
 from services.mongodb import MongoDBService
-from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service, get_mem0_service
+from dependencies import get_db_service, get_llm_service, verify_token, get_mongodb_service
 
 router = APIRouter(prefix="/database", tags=["database"])
 
@@ -244,10 +244,9 @@ async def get_database_status(
 async def list_tables(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
     current_user: Annotated[str, Depends(verify_token)],
-    task_id: Optional[int] = None,
-    mem0_service: Annotated[Any, Depends(get_mem0_service)] = None
+    task_id: Optional[int] = None
 ):
-    """List all tables in the currently connected database (filtered by active permissions)"""
+    """List all tables in the currently connected database"""
     try:
         if not db_service.is_connected():
             raise HTTPException(
@@ -256,58 +255,6 @@ async def list_tables(
             )
         
         tables = db_service.get_tables()
-        
-        # Resolve permissions
-        permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-        if mem0_service:
-            if current_user:
-                try:
-                    permissions = mem0_service.get_user_permissions(current_user)
-                except Exception:
-                    permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": []}
-
-            if task_id:
-                try:
-                    memories = mem0_service.client.get_all(filters={"user_id": "global"})
-                    task_tables = None
-                    for m in memories:
-                        meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                        if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                            raw_tables = meta.get("tables", "[]")
-                            try:
-                                import json
-                                task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                            except Exception:
-                                task_tables = []
-                            break
-                    
-                    if task_tables is not None:
-                        if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                            u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                            t_allowed = {t.lower() for t in task_tables}
-                            permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                        else:
-                            permissions["allowed_tables"] = task_tables
-                    else:
-                        permissions["allowed_tables"] = ["*"]
-                except Exception:
-                    permissions["allowed_tables"] = ["*"]
-            else:
-                # if no task_id then allowed all the table by default
-                permissions["allowed_tables"] = ["*"]
-                permissions["restricted_tables"] = []
-
-        # Filter the tables list based on resolved permissions
-        role = permissions.get("role", "standard")
-        if role != "admin":
-            allowed_tables = permissions.get("allowed_tables")
-            if allowed_tables is not None and allowed_tables != ["*"]:
-                allowed_lower = {t.lower() for t in allowed_tables}
-                tables = [t for t in tables if t.lower() in allowed_lower]
-            elif permissions.get("restricted_tables"):
-                restricted_lower = {t.lower() for t in permissions["restricted_tables"]}
-                tables = [t for t in tables if t.lower() not in restricted_lower]
-        
         params = db_service.get_connection_params()
         return {
             "status": "success",
@@ -553,14 +500,13 @@ async def execute_sql_batch(
 async def get_table_data(
     table_name: str,
     db_service: Annotated[DatabaseService, Depends(get_db_service)],
-    mem0_service: Annotated[Any, Depends(get_mem0_service)],
     current_user: Annotated[str, Depends(verify_token)],
     limit: int = 100,
     offset: int = 0,
     task_id: Optional[str] = None
 ):
     """
-    Fetch records/data from a specific database table, subject to RBAC and optional task limits.
+    Fetch records/data from a specific database table.
     """
     if not db_service.is_connected():
         raise HTTPException(
@@ -589,67 +535,6 @@ async def get_table_data(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Table '{table_name}' does not exist in the connected database."
         )
-
-    # 2. RBAC Permissions Enforcement
-    permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-    if mem0_service:
-        if current_user:
-            try:
-                permissions = mem0_service.get_user_permissions(current_user)
-            except Exception as e:
-                # Default standard permissions if fetch fails
-                permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": []}
-
-        # Resolve task mapping if task_id is provided
-        if task_id:
-            try:
-                memories = mem0_service.client.get_all(filters={"user_id": "global"})
-                task_tables = None
-                for m in memories:
-                    meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                    if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                        raw_tables = meta.get("tables", "[]")
-                        try:
-                            import json
-                            task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                        except Exception:
-                            task_tables = []
-                        break
-                
-                if task_tables is not None:
-                    # Restrict allowed_tables to task_tables
-                    if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                        u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                        t_allowed = {t.lower() for t in task_tables}
-                        permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                    else:
-                        permissions["allowed_tables"] = task_tables
-                else:
-                    permissions["allowed_tables"] = ["*"]
-            except Exception as task_err:
-                # Restrict all access if task lookup fails
-                permissions["allowed_tables"] = ["*"]
-        else:
-            # if no task_id then allowed all the table by default
-            permissions["allowed_tables"] = ["*"]
-            permissions["restricted_tables"] = []
-
-    # 3. Check if table is allowed
-    allowed_tables = permissions.get("allowed_tables", ["*"])
-    if allowed_tables is not None and allowed_tables != ["*"]:
-        allowed_lower = {t.lower() for t in allowed_tables}
-        if safe_table.lower() not in allowed_lower:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access Denied: You do not have permission to query table."
-            )
-    elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
-        restricted_lower = {t.lower() for t in permissions["restricted_tables"]}
-        if safe_table.lower() in restricted_lower:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access Denied: Query attempts to read restricted table."
-            )
 
     # 4. Construct Dialect-Aware Query (fully safe as table name comes from get_tables())
     try:

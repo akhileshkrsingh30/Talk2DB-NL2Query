@@ -186,32 +186,4 @@ class MongoDBQueryResult(BaseModel):
         json_encoders = {
             datetime: lambda v: v.isoformat(),
         }
-
-# ============================================================================
-# RBAC Schemas
-# ============================================================================
-
-class UserPolicyRequest(BaseModel):
-    username: str = Field(..., description="Target user identifier (email/username)")
-    role: str = Field("standard", description="User role (standard, manager, admin)")
-    department: str = Field(..., description="User department")
-    restricted_tables: List[str] = Field(default_factory=list, description="List of table names user is restricted from querying")
-
-class UserPolicyRawRequest(BaseModel):
-    username: Optional[str] = Field(None, description="Target user identifier (optional if agent_id is provided)")
-    agent_id: Optional[str] = Field(None, description="Target agent identifier (optional if username is provided)")
-    memory: str = Field(..., description="Raw natural language policy memory to store")
-
-class UserPolicyResponse(BaseModel):
-    username: str = Field(..., description="Target user identifier")
-    resolved_permissions: Dict[str, Any] = Field(..., description="Parsed permissions rules currently active for the user")
-
-class MemoryStoreRequest(BaseModel):
-    content: str = Field(..., description="The content/text data to store in memory")
-    user_id: Optional[str] = Field(None, description="The user identifier to associate the memory with")
-    agent_id: Optional[str] = Field(None, description="The agent identifier to associate the memory with")
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional key-value metadata to store with the memory")
-
-class MemoriesRequest(BaseModel):
-    task_id: int = Field(..., description="The ID of the task")
-    tables: List[str] = Field(..., description="List of tables associated with the task")
+

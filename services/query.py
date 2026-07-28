@@ -14,12 +14,11 @@ from config import settings
 
 
 class QueryService:
-    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None, mem0_service = None):
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None):
         self.db_service = db_service
         self.llm_service = llm_service
         self.billing_service = billing_service
         self.mongodb_service = mongodb_service
-        self.mem0_service = mem0_service
         self.query_history = []
         try:
             self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -48,7 +47,7 @@ class QueryService:
                       user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
                       background_tasks: Any = None, task_id: int = None) -> Dict[str, Any]:
         """Process natural language query and return results.
-        Flow: fetch Mem0 RBAC -> schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
+        Flow: schema fetch → SQL generation → auto-repair on error → execution → explanation
         """
         start_time = time.time()
 
@@ -56,52 +55,6 @@ class QueryService:
             self.validate_prerequisites()
 
             logging.info(f"--- START PROCESSING QUERY: '{user_query[:80]}' ---")
-
-            # Fetch Mem0 Permissions
-            permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-            if self.mem0_service:
-                if user_id:
-                    permissions = self.mem0_service.get_user_permissions(user_id)
-                    logging.info(f"[RBAC] Active permissions from Mem0: {permissions}")
-                    print(f"[Mem0 RBAC Return] Active permissions for user {user_id}: {permissions}")
-                
-                # Fetch task mapping if task_id is provided
-                if task_id:
-                    try:
-                        memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
-                        print(f"[Mem0 Raw Return] Raw memories fetched from Mem0: {memories}")
-                        task_tables = None
-                        for m in memories:
-                            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                            if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                                print(f"[Mem0 Matched Memory] Found task mapping in Mem0: {m}")
-                                raw_tables = meta.get("tables", "[]")
-                                try:
-                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                                except Exception:
-                                    task_tables = []
-                                break
-                        
-                        if task_tables is not None:
-                            logging.info(f"[Task Security] Enforcing task {task_id} allowed tables: {task_tables}")
-                            # Override allowed_tables to restrict to the task's allowed tables
-                            if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                                u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                                t_allowed = {t.lower() for t in task_tables}
-                                permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                            else:
-                                permissions["allowed_tables"] = task_tables
-                            print(f"[Mem0 Tables] task_id: {task_id} | Allowed tables sent to LLM: {permissions['allowed_tables']}")
-                        else:
-                            logging.warning(f"[Task Security] Task {task_id} not found in Mem0. Access defaults to all tables.")
-                            permissions["allowed_tables"] = ["*"]
-                            print(f"[Mem0 Tables] task_id: {task_id} not found in Mem0 | Defaults sent to LLM: {permissions['allowed_tables']}")
-                    except Exception as task_err:
-                        logging.error(f"[Task Security] Failed to lookup task {task_id}: {task_err}")
-                else:
-                    # if no task_id then allowed all the table by default
-                    permissions["allowed_tables"] = ["*"]
-                    permissions["restricted_tables"] = []
 
             db_params = self.db_service.get_connection_params()
             db_name = db_params.get("database", "unknown")
@@ -114,20 +67,16 @@ class QueryService:
 
             schema_context = ""
             try:
-                allowed_tables = permissions.get("allowed_tables")
-                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+                schema_context = self.db_service.get_simplified_schema()
                 if schema_context:
-                    if allowed_tables is not None and allowed_tables != ["*"]:
-                        logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars) filtered by task allowed tables: {allowed_tables}")
-                    else:
-                        logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars). Bypassing schema filtering to send full schema to LLM.")
+                    logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars).")
                 else:
                     logging.error("[STEP 1] Schema is empty — cannot generate SQL.")
             except Exception as schema_err:
                 logging.error(f"[STEP 1] Schema fetch failed: {schema_err}")
 
             if task_id:
-                schema_context = f"these are the table task_id {task_id} is allowed\nthese are the table task_id{task_id} is allowed\n\n" + schema_context
+                schema_context = f"task_id: {task_id}\n\n" + schema_context
 
             # Truncate if oversized
             if len(schema_context) > settings.llm_max_context_chars:
@@ -137,7 +86,6 @@ class QueryService:
             logging.info(f"[STEP 1] Schema sent to LLM:\n{schema_context}\n{'─'*60}")
 
             # ── Meta-query injection ────────────────────────────────────────────
-            # If the user is asking about DB structure, prepend information_schema hints
             if self._detect_meta_query(user_query):
                 meta_context = self._get_meta_context(db_name, dialect)
                 schema_context = meta_context + "\n\n" + schema_context
@@ -147,24 +95,7 @@ class QueryService:
             logging.info(f"[STEP 2] Generating {dialect.upper()} SQL...")
             sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
 
-            # Inject Row-level Filter constraints from Mem0
             augmented_query = user_query
-            if permissions.get("role") != "admin" and permissions.get("row_filters"):
-                filter_str = " AND ".join(permissions["row_filters"])
-                augmented_query += f"\n(CONSTRAINT: Ensure the generated SQL only returns records satisfying: {filter_str})"
-
-            if task_id and permissions.get("allowed_tables") and permissions["allowed_tables"] != ["*"]:
-                allowed_tables_str = ", ".join(permissions["allowed_tables"])
-                allowed_list_quoted = ", ".join(f"'{t}'" for t in permissions["allowed_tables"])
-                augmented_query += (
-                    f"\n(STRICT CONSTRAINT: You MUST only use and query the following allowed tables for task {task_id}: {allowed_tables_str}. "
-                    f"Do NOT generate SQL querying any other tables, even if they are listed in system metadata or elsewhere. "
-                    f"If you are querying system catalogs/metadata views (like information_schema.tables or information_schema.columns), "
-                    f"you MUST append a WHERE filter on the table name column (e.g., table_name IN ({allowed_list_quoted})) "
-                    f"so that ONLY the allowed tables are returned in the query results. "
-                    f"Never expose or query any other tables under any circumstances.)"
-                )
-
             input_tokens += self.count_tokens(augmented_query) + self.count_tokens(schema_context)
 
             try:
@@ -205,38 +136,10 @@ class QueryService:
 
             logging.info(f"[STEP 2] Extracted {len(sql_queries)} SQL queries.")
 
-            # Post-Generation Guardrail: block SQL referencing tables outside allowed list
-            allowed_tables = permissions.get("allowed_tables", ["*"])
-            try:
-                db_tables = self.db_service.get_tables()
-            except Exception:
-                db_tables = []
-
-            if allowed_tables is not None and allowed_tables != ["*"]:
-                allowed_lower = {t.lower() for t in allowed_tables}
-                for sql in sql_queries:
-                    for table in db_tables:
-                        if table.lower() not in allowed_lower:
-                            if re.search(rf"\b{re.escape(table)}\b", sql, re.IGNORECASE):
-                                error_msg_rbac = f"Access Denied: You do not have permission to query table."
-                                logging.warning(f"[RBAC] BLOCKED user={user_id} | table='{table}' | sql={sql[:80]}")
-                                if self.mem0_service:
-                                    self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                                raise ValueError(error_msg_rbac)
-            elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
-                for sql in sql_queries:
-                    for restricted_table in permissions["restricted_tables"]:
-                        if re.search(rf"\b{restricted_table}\b", sql, re.IGNORECASE):
-                            error_msg_rbac = f"Access Denied: Query attempts to read restricted table ."
-                            logging.warning(f"[RBAC] User {user_id} blocked: restricted table '{restricted_table}'.")
-                            if self.mem0_service:
-                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                            raise ValueError(error_msg_rbac)
-
             # ── STEP 3: Execute SQL (with one auto-repair retry) ────────────────
             logging.info(f"[STEP 3] Executing {len(sql_queries)} queries against '{db_name}'...")
             results = []
-            final_sql_queries = list(sql_queries)  # may be replaced by repaired versions
+            final_sql_queries = list(sql_queries)
 
             for i, query in enumerate(final_sql_queries):
                 logging.info(f"   → Q{i+1}: {query[:120]}")
@@ -259,31 +162,8 @@ class QueryService:
                         if repaired_queries:
                             repaired_query = repaired_queries[0]
                             logging.info(f"[STEP 3] Repaired SQL:\n{repaired_query}")
-                            
-                            # Post-Generation Guardrail Check on Repaired SQL output
-                            allowed_tables = permissions.get("allowed_tables", ["*"])
-                            if allowed_tables is not None and allowed_tables != ["*"]:
-                                allowed_lower = {t.lower() for t in allowed_tables}
-                                for table in db_tables:
-                                    if table.lower() not in allowed_lower:
-                                        if re.search(rf"\b{re.escape(table)}\b", repaired_query, re.IGNORECASE):
-                                            error_msg_rbac = f"Access Denied: You do not have permission to query table."
-                                            logging.warning(f"[RBAC] BLOCKED user={user_id} | table='{table}' | sql={repaired_query[:80]}")
-                                            if self.mem0_service:
-                                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                                            raise ValueError(error_msg_rbac)
-
-                            if permissions.get("role") != "admin" and permissions.get("restricted_tables"):
-                                for restricted_table in permissions["restricted_tables"]:
-                                    if re.search(rf"\b{restricted_table}\b", repaired_query, re.IGNORECASE):
-                                        error_msg_rbac = f"Access Denied: Repaired query attempts to read restricted table ."
-                                        logging.warning(f"[RBAC] User {user_id} blocked: repaired query tried to access restricted table '{restricted_table}'. SQL: {repaired_query}")
-                                        if self.mem0_service:
-                                            self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                                        raise ValueError(error_msg_rbac)
-                                        
                             query_result = self.db_service.execute_query(repaired_query)
-                            final_sql_queries[i] = repaired_query  # record the repaired version
+                            final_sql_queries[i] = repaired_query
                             logging.info(f"[STEP 3] Repaired query executed successfully.")
                         else:
                             raise RuntimeError("Repair chain returned no valid SQL.")
@@ -294,8 +174,7 @@ class QueryService:
                             f"Original error: {error_msg}\nRepair error: {repair_err}"
                         )
 
-                # Normalise result format
-                query_result = self._filter_metadata_results(query_result, allowed_tables)
+                # Normalize result format
                 if isinstance(query_result, (list, dict)):
                     results.append(query_result)
                 else:
@@ -314,10 +193,6 @@ class QueryService:
             })
             output_tokens += self.count_tokens(str(explanation))
             logging.info("--- FINISHED PROCESSING QUERY ---")
-
-            # Audit successful execution in Mem0
-            if self.mem0_service:
-                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Success")
 
             # ── Build response ──────────────────────────────────────────────────
             execution_time = time.time() - start_time
@@ -353,7 +228,6 @@ class QueryService:
                     except Exception as e:
                         logging.error(f"[ERROR] Failed to schedule background task for MongoDB save: {e}")
                 else:
-                    # Fallback to background thread if background_tasks is not provided (e.g., in ThreadPoolExecutor)
                     try:
                         import threading
                         def save_bg(mongodb_svc, resp):
@@ -378,9 +252,7 @@ class QueryService:
     async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
                           user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
                           task_id: int = None):
-        """Process natural language query and stream results chunk by chunk.
-        Enforces schema discovery, RBAC, meta-query injection, auto-repair, explanation streaming, auditing, and persistence.
-        """
+        """Process natural language query and stream results chunk by chunk."""
         start_time = time.time()
         input_tokens = self.count_tokens(user_query)
         output_tokens = 0
@@ -389,66 +261,19 @@ class QueryService:
             # 1. Validation & Initialization
             self.validate_prerequisites()
             yield json.dumps({"type": "status", "content": "Analyzing query and discovering schema..."}) + "\n"
-            
-            # Fetch Mem0 Permissions
-            permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-            if self.mem0_service:
-                if user_id:
-                    permissions = self.mem0_service.get_user_permissions(user_id)
-                    logging.info(f"[RBAC] [STREAM] Active permissions from Mem0: {permissions}")
-                    print(f"[Mem0 RBAC Return] [STREAM] Active permissions for user {user_id}: {permissions}")
-                
-                # Fetch task mapping if task_id is provided
-                if task_id:
-                    try:
-                        memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
-                        print(f"[Mem0 Raw Return] [STREAM] Raw memories fetched from Mem0: {memories}")
-                        task_tables = None
-                        for m in memories:
-                            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                            if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                                print(f"[Mem0 Matched Memory] [STREAM] Found task mapping in Mem0: {m}")
-                                raw_tables = meta.get("tables", "[]")
-                                try:
-                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                                except Exception:
-                                    task_tables = []
-                                break
-                        
-                        if task_tables is not None:
-                            logging.info(f"[Task Security] Enforcing task {task_id} allowed tables: {task_tables}")
-                            # Override allowed_tables to restrict to the task's allowed tables
-                            if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                                u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                                t_allowed = {t.lower() for t in task_tables}
-                                permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                            else:
-                                permissions["allowed_tables"] = task_tables
-                            print(f"[Mem0 Tables] [STREAM] task_id: {task_id} | Allowed tables sent to LLM: {permissions['allowed_tables']}")
-                        else:
-                            logging.warning(f"[Task Security] Task {task_id} not found in Mem0. Access defaults to all tables.")
-                            permissions["allowed_tables"] = ["*"]
-                            print(f"[Mem0 Tables] [STREAM] task_id: {task_id} not found in Mem0 | Defaults sent to LLM: {permissions['allowed_tables']}")
-                    except Exception as task_err:
-                        logging.error(f"[Task Security] Failed to lookup task {task_id}: {task_err}")
-                else:
-                    # if no task_id then allowed all the table by default
-                    permissions["allowed_tables"] = ["*"]
-                    permissions["restricted_tables"] = []
 
             db_params = self.db_service.get_connection_params()
             db_name = db_params.get("database", "unknown")
             dialect = self.db_service.db_type
 
             # Fetch simplified schema
-            allowed_tables = permissions.get("allowed_tables")
-            schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+            schema_context = self.db_service.get_simplified_schema()
             if not schema_context:
                 yield json.dumps({"type": "status", "content": "Falling back to database schema..."}) + "\n"
-                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+                schema_context = self.db_service.get_simplified_schema()
 
             if task_id:
-                schema_context = f"these are the table task_id {task_id} is allowed\nthese are the table task_id{task_id} is allowed\n\n" + schema_context
+                schema_context = f"task_id: {task_id}\n\n" + schema_context
 
             # Truncate if oversized
             if len(schema_context) > settings.llm_max_context_chars:
@@ -466,22 +291,6 @@ class QueryService:
             sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
 
             augmented_query = user_query
-            if permissions.get("role") != "admin" and permissions.get("row_filters"):
-                filter_str = " AND ".join(permissions["row_filters"])
-                augmented_query += f"\n(CONSTRAINT: Ensure the generated SQL only returns records satisfying: {filter_str})"
-
-            if task_id and permissions.get("allowed_tables") and permissions["allowed_tables"] != ["*"]:
-                allowed_tables_str = ", ".join(permissions["allowed_tables"])
-                allowed_list_quoted = ", ".join(f"'{t}'" for t in permissions["allowed_tables"])
-                augmented_query += (
-                    f"\n(STRICT CONSTRAINT: You MUST only use and query the following allowed tables for task {task_id}: {allowed_tables_str}. "
-                    f"Do NOT generate SQL querying any other tables, even if they are listed in system metadata or elsewhere. "
-                    f"If you are querying system catalogs/metadata views (like information_schema.tables or information_schema.columns), "
-                    f"you MUST append a WHERE filter on the table name column (e.g., table_name IN ({allowed_list_quoted})) "
-                    f"so that ONLY the allowed tables are returned in the query results. "
-                    f"Never expose or query any other tables under any circumstances.)"
-                )
-
             input_tokens += self.count_tokens(augmented_query) + self.count_tokens(schema_context)
 
             try:
@@ -517,34 +326,6 @@ class QueryService:
             if not sql_queries:
                 raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
 
-            # Post-Generation Guardrail Check on Generated SQL
-            allowed_tables = permissions.get("allowed_tables", ["*"])
-            try:
-                db_tables = self.db_service.get_tables()
-            except Exception:
-                db_tables = []
-
-            if allowed_tables is not None and allowed_tables != ["*"]:
-                allowed_lower = {t.lower() for t in allowed_tables}
-                for sql in sql_queries:
-                    for table in db_tables:
-                        if table.lower() not in allowed_lower:
-                            if re.search(rf"\b{re.escape(table)}\b", sql, re.IGNORECASE):
-                                error_msg_rbac = f"Access Denied: You do not have permission to query table."
-                                logging.warning(f"[RBAC] [STREAM] BLOCKED user={user_id} | table='{table}' | sql={sql[:80]}")
-                                if self.mem0_service:
-                                    self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                                raise ValueError(error_msg_rbac)
-            elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
-                for sql in sql_queries:
-                    for restricted_table in permissions["restricted_tables"]:
-                        if re.search(rf"\b{restricted_table}\b", sql, re.IGNORECASE):
-                            error_msg_rbac = f"Access Denied: Query attempts to read restricted table ."
-                            logging.warning(f"[RBAC] [STREAM] User {user_id} blocked: restricted table '{restricted_table}'.")
-                            if self.mem0_service:
-                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                            raise ValueError(error_msg_rbac)
-
             # 4. SQL Execution (with one auto-repair retry)
             yield json.dumps({"type": "status", "content": "Executing SQL and retrieving data..."}) + "\n"
             results = []
@@ -571,31 +352,8 @@ class QueryService:
                         if repaired_queries:
                             repaired_query = repaired_queries[0]
                             logging.info(f"[STREAM] Repaired SQL:\n{repaired_query}")
-                            
-                            # Post-Generation Guardrail Check on Repaired SQL
-                            allowed_tables = permissions.get("allowed_tables", ["*"])
-                            if allowed_tables is not None and allowed_tables != ["*"]:
-                                allowed_lower = {t.lower() for t in allowed_tables}
-                                for table in db_tables:
-                                    if table.lower() not in allowed_lower:
-                                        if re.search(rf"\b{re.escape(table)}\b", repaired_query, re.IGNORECASE):
-                                            error_msg_rbac = f"Access Denied: You do not have permission to query table."
-                                            logging.warning(f"[RBAC] [STREAM] BLOCKED user={user_id} | table='{table}' | sql={repaired_query[:80]}")
-                                            if self.mem0_service:
-                                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                                            raise ValueError(error_msg_rbac)
-
-                            if permissions.get("role") != "admin" and permissions.get("restricted_tables"):
-                                for restricted_table in permissions["restricted_tables"]:
-                                    if re.search(rf"\b{restricted_table}\b", repaired_query, re.IGNORECASE):
-                                        error_msg_rbac = f"Access Denied: Repaired query attempts to read restricted table ."
-                                        logging.warning(f"[RBAC] [STREAM] User {user_id} blocked: repaired query tried to access restricted table '{restricted_table}'.")
-                                        if self.mem0_service:
-                                            self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
-                                        raise ValueError(error_msg_rbac)
-                                        
                             query_result = self.db_service.execute_query(repaired_query)
-                            final_sql_queries[i] = repaired_query  # record the repaired version
+                            final_sql_queries[i] = repaired_query
                             logging.info(f"[STREAM] Repaired query executed successfully.")
                         else:
                             raise RuntimeError("Repair chain returned no valid SQL.")
@@ -606,8 +364,7 @@ class QueryService:
                             f"Original error: {error_msg}\nRepair error: {repair_err}"
                         )
 
-                # Normalise result format
-                query_result = self._filter_metadata_results(query_result, allowed_tables)
+                # Normalize result format
                 if isinstance(query_result, (list, dict)):
                     results.append(query_result)
                 else:
@@ -635,10 +392,6 @@ class QueryService:
                 yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
             
             output_tokens += self.count_tokens(full_explanation)
-            
-            # Audit successful execution in Mem0
-            if self.mem0_service:
-                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Success")
 
             # Calculate billing info
             execution_time = time.time() - start_time
@@ -709,18 +462,15 @@ class QueryService:
     def _detect_meta_query(self, query: str) -> bool:
         """Detect if the query is asking about the database structure itself (metadata)."""
         meta_keywords = [
-            # tables — all common phrasings
             "number of tables", "how many tables", "list tables", "list table",
             "all tables", "all the tables", "what are all the tables",
             "what are the tables", "tables in the db", "tables in the database",
             "tables exist", "available tables", "existing tables",
             "show tables", "show table", "what tables", "which tables",
             "tables available", "tables do we have", "tables are there",
-            # columns
             "all the columns", "list columns", "list column", "show columns",
             "show column", "what columns", "which columns", "all columns",
             "column names", "column name",
-            # schemas / structure
             "list schemas", "list schema", "all schemas", "database schema", "schema list",
             "database size", "database version",
             "metadata", "structure", "describe table", "describe tables",
@@ -788,7 +538,6 @@ class QueryService:
             full_name = node.get('full_name', f"public.{name}")
             role = node.get('role', 'anchor' if node.get('score', 0) > 100 else 'bridge/lookup')
             
-            # Identify columns
             cols = node.get('columns', [])
             col_list = ", ".join([f"{c['name']} ({c['type']})" for c in cols[:15]])
             
@@ -802,7 +551,6 @@ class QueryService:
 
     def get_history(self, limit: int = 10, message_id: Optional[str] = None, session_id: Optional[str] = None, company_id: Optional[str] = None, task_id: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get query history. Falls back to MongoDB if available for persistent history."""
-        # Try to get from MongoDB for persistent history
         if self.mongodb_service and hasattr(self.mongodb_service, "is_ready") and self.mongodb_service.is_ready():
             try:
                 mongo_history = self.mongodb_service.get_history(
@@ -818,7 +566,6 @@ class QueryService:
             except Exception as e:
                 print(f"[ERROR] Failed to fetch history from MongoDB: {e}")
         elif self.mongodb_service:
-            # Try calling without is_ready check in case of legacy connection wrapper
             try:
                 mongo_history = self.mongodb_service.get_history(
                     limit=limit,
@@ -833,7 +580,6 @@ class QueryService:
             except Exception as e:
                 pass
         
-        # Fallback to in-memory history
         results = self.query_history
         if message_id:
             results = [r for r in results if r.get("message_id") == message_id]
@@ -863,48 +609,3 @@ class QueryService:
         if not self.query_history:
             raise ValueError("No query results in history")
         return self.query_history[-1]
-
-    def _apply_schema_rbac(self, schema_context: str, restricted_tables: List[str]) -> str:
-        """
-        Parses the simplified schema text and removes any blocks associated with
-        restricted tables to hide columns and indices from SQL generation.
-        """
-        if not schema_context or not restricted_tables:
-            return schema_context
-            
-        lines = schema_context.split("\n")
-        filtered_lines = []
-        skip_block = False
-        
-        for line in lines:
-            if line.startswith("Table:") or line.startswith("CREATE TABLE"):
-                skip_block = False
-                for table in restricted_tables:
-                    if f".{table}" in line or f" {table}" in line or line.endswith(table):
-                        skip_block = True
-                        break
-            
-            if not skip_block:
-                filtered_lines.append(line)
-                
-        return "\n".join(filtered_lines)
-
-    def _filter_metadata_results(self, query_result: Any, allowed_tables: Optional[List[str]]) -> Any:
-        """Filter out any metadata/information_schema results that expose unauthorized tables."""
-        if allowed_tables is None or allowed_tables == ["*"] or not isinstance(query_result, list):
-            return query_result
-            
-        allowed_lower = {t.lower() for t in allowed_tables}
-        filtered_rows = []
-        for row in query_result:
-            if isinstance(row, dict):
-                is_unauthorized = False
-                for k, v in row.items():
-                    if k.lower() in ("table_name", "relname", "table"):
-                        if str(v).lower() not in allowed_lower:
-                            is_unauthorized = True
-                            break
-                if is_unauthorized:
-                    continue
-            filtered_rows.append(row)
-        return filtered_rows
