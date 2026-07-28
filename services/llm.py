@@ -150,7 +150,7 @@ class LLMService:
         from config import settings
         
         # Priority: Settings -> os.environ
-        api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY") or os.getenv("KRUTIM_CLOUD_API_KEY")
+        api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
         
         if api_key and api_key.strip():
             try:

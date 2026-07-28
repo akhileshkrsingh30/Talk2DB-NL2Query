@@ -49,12 +49,12 @@ async def connect_to_database(
         if success:
             # When database connects, also ensure LLM is configured if it isn't already
             if not llm_service.is_configured():
-                api_key = settings.krutim_cloud_api_key or settings.openai_api_key
+                api_key = settings.openai_api_key
                 if api_key and api_key.strip():
                     try:
                         llm_service.configure(
                             api_key=api_key,
-                            base_url=settings.openai_api_base or (None if settings.openai_api_key else "https://api.krutim.ai/v1"),
+                            base_url=settings.openai_api_base,
                             model=settings.llm_model_name,
                             validate_key=False
                         )
@@ -321,7 +321,7 @@ async def configure_llm(
         llm_service.reset_configuration()
         
         # Use provided value or fall back to settings
-        api_key = config.api_key or settings.krutim_cloud_api_key or settings.openai_api_key
+        api_key = config.api_key or settings.openai_api_key
         api_base = config.api_base or settings.openai_api_base
         model = config.model or settings.llm_model_name
         

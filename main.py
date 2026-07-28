@@ -68,14 +68,14 @@ async def lifespan(app: FastAPI):
 
     # Try to configure LLM from environment variables
     import os
-    api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY") or os.getenv("KRUTIM_CLOUD_API_KEY")
+    api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
     
     if api_key and api_key.strip():
         try:
             print(f"Auto-Configuring LLM (Primary key detected: {api_key[:10]}...)")
             llm_service.configure(
                 api_key=api_key,
-                base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE") or (None if (settings.openai_api_key or os.getenv("OPENAI_API_KEY")) else "https://api.krutim.ai/v1"),
+                base_url=settings.openai_api_base or os.getenv("OPENAI_API_BASE"),
                 model=settings.llm_model_name,
                 validate_key=False
             )

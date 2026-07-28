@@ -45,7 +45,7 @@ def get_llm_service() -> LLMService:
         service = service_registry.get_llm_service()
         # Proactive auto-configuration if not already configured
         if not service.is_configured():
-            api_key = settings.krutim_cloud_api_key or settings.openai_api_key or os.getenv("OPENAI_API_KEY")
+            api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
             if api_key and api_key.strip():
                 try:
                     service.configure(
