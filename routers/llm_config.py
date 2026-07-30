@@ -13,6 +13,7 @@ class LLMConfigRequest(BaseModel):
     api_key: Optional[str] = Field(None, description="LLM API key (falls back to .env if not provided)")
     api_base: Optional[str] = Field(None, description="LLM API base URL (falls back to .env if not provided)")
     model: Optional[str] = Field(None, description="Model name (falls back to .env if not provided)")
+    validate_key: Optional[bool] = Field(True, description="Whether to validate API key and connection during configuration")
 
 class LLMConfigResponse(BaseModel):
     status: str = Field(..., description="Configuration status")
@@ -35,7 +36,8 @@ async def configure_llm(
         success = llm_service.configure(
             api_key=api_key,
             base_url=api_base,
-            model=model
+            model=model,
+            validate_key=config.validate_key if config.validate_key is not None else True
         )
         
         if success:

@@ -27,11 +27,12 @@ class Settings(BaseSettings):
     db_password: str = Field("", env="DB_PASSWORD")
     
     # LLM configuration
-    openai_api_key: str = Field("", env="OPENAI_API_KEY")
-    openai_api_base: str = Field("", env="OPENAI_API_BASE")
-    llm_model_name: str = Field("gpt-5.2", env="LLM_MODEL_NAME")
+    openai_api_key: str = Field("none", env="OPENAI_API_KEY")
+    openai_api_base: str = Field("http://10.199.207.232:8005/v1", env="OPENAI_API_BASE")
+    llm_model_name: str = Field("Qwen/Qwen2.5-Coder-32B-Instruct-AWQ", env="LLM_MODEL_NAME")
     llm_max_context_chars: int = Field(100000, env="LLM_MAX_CONTEXT_CHARS")
-    llm_max_output_tokens: int = Field(4096, env="LLM_MAX_OUTPUT_TOKENS")
+    llm_max_output_tokens: int = Field(8000, env="LLM_MAX_OUTPUT_TOKENS")
+    sql_repair_max_attempts: int = Field(2, env="SQL_REPAIR_MAX_ATTEMPTS")
     
     # Billing configuration (Price per 1M tokens in USD)
     price_input_1m: float = Field(0.15, env="BILLING_PRICE_INPUT_1M")

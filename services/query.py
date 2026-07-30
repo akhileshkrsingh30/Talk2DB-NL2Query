@@ -13,6 +13,27 @@ import re
 from config import settings
 
 
+def _extract_invalid_identifier_hint(error_message: str) -> Optional[str]:
+    """Best-effort extraction of the invalid table/column identifier from a DB error
+    message, so the repair prompt can be given an explicit correction target instead
+    of just the raw driver error text."""
+    patterns = [
+        r'column ["\']?([\w\.]+)["\']? does not exist',       # PostgreSQL column
+        r'relation ["\']?([\w\.]+)["\']? does not exist',     # PostgreSQL table
+        r'[Uu]nknown column ["\']?([\w\.]+)["\']?',            # MySQL/MariaDB column
+        r"[Tt]able ['\"]?([\w\.]+)['\"]? doesn'?t exist",      # MySQL/MariaDB table
+        r'[Ii]nvalid column name ["\']?([\w\.]+)["\']?',       # MSSQL column
+        r'[Ii]nvalid object name ["\']?([\w\.]+)["\']?',       # MSSQL table
+        r'ORA-00904:\s*"?([\w\."]+)"?\s*:\s*invalid identifier',  # Oracle column
+        r'ORA-00942:.*table or view does not exist',           # Oracle table (no identifier captured)
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, error_message)
+        if match and match.groups():
+            return match.group(1)
+    return None
+
+
 class QueryService:
     def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None):
         self.db_service = db_service
@@ -65,9 +86,13 @@ class QueryService:
             input_tokens = self.count_tokens(user_query)
             output_tokens = 0
 
+            allowed_tables, kw_tokens_in, kw_tokens_out = self._narrow_allowed_tables(user_query)
+            input_tokens += kw_tokens_in
+            output_tokens += kw_tokens_out
+
             schema_context = ""
             try:
-                schema_context = self.db_service.get_simplified_schema()
+                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
                 if schema_context:
                     logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars).")
                 else:
@@ -136,43 +161,75 @@ class QueryService:
 
             logging.info(f"[STEP 2] Extracted {len(sql_queries)} SQL queries.")
 
-            # ── STEP 3: Execute SQL (with one auto-repair retry) ────────────────
-            logging.info(f"[STEP 3] Executing {len(sql_queries)} queries against '{db_name}'...")
+            # ── STEP 3: Execute SQL (with bounded auto-repair retries) ──────────
+            max_repair_attempts = max(0, settings.sql_repair_max_attempts)
+            logging.info(f"[STEP 3] Executing {len(sql_queries)} queries against '{db_name}' "
+                         f"(up to {max_repair_attempts} repair attempt(s) each)...")
             results = []
             final_sql_queries = list(sql_queries)
 
             for i, query in enumerate(final_sql_queries):
                 logging.info(f"   → Q{i+1}: {query[:120]}")
-                try:
-                    query_result = self.db_service.execute_query(query)
-                except Exception as exec_err:
-                    error_msg = str(exec_err)
-                    logging.warning(f"[STEP 3] Q{i+1} failed: {error_msg}. Attempting auto-repair...")
+                current_sql = query
+                attempted_sql = [query]
+                query_result = None
+                last_error = None
 
+                for attempt in range(max_repair_attempts + 1):
                     try:
-                        repair_chain = self.llm_service.create_sql_repair_chain(dialect=dialect)
-                        repaired_sql = repair_chain.invoke({
-                            "Question": augmented_query,
-                            "schema_context": schema_context,
-                            "failed_sql": query,
-                            "error_message": error_msg
-                        })
-                        output_tokens += self.count_tokens(str(repaired_sql))
-                        repaired_queries = extract_sql_queries(str(repaired_sql))
-                        if repaired_queries:
-                            repaired_query = repaired_queries[0]
-                            logging.info(f"[STEP 3] Repaired SQL:\n{repaired_query}")
-                            query_result = self.db_service.execute_query(repaired_query)
-                            final_sql_queries[i] = repaired_query
-                            logging.info(f"[STEP 3] Repaired query executed successfully.")
-                        else:
-                            raise RuntimeError("Repair chain returned no valid SQL.")
-                    except Exception as repair_err:
-                        logging.error(f"[STEP 3] Auto-repair also failed: {repair_err}")
-                        raise RuntimeError(
-                            f"Query execution failed and could not be auto-repaired.\n"
-                            f"Original error: {error_msg}\nRepair error: {repair_err}"
-                        )
+                        query_result = self.db_service.execute_query(current_sql)
+                        final_sql_queries[i] = current_sql
+                        last_error = None
+                        break
+                    except Exception as exec_err:
+                        last_error = str(exec_err)
+                        if attempt == max_repair_attempts:
+                            break
+
+                        logging.warning(f"[STEP 3] Q{i+1} attempt {attempt + 1} failed: {last_error}. "
+                                         f"Attempting auto-repair ({attempt + 1}/{max_repair_attempts})...")
+                        invalid_ref = _extract_invalid_identifier_hint(last_error)
+                        error_for_repair = last_error
+                        if invalid_ref:
+                            error_for_repair += (
+                                f"\n\nCRITICAL HINT: The column/identifier '{invalid_ref}' DOES NOT EXIST in the schema! "
+                                f"DO NOT USE '{invalid_ref}' again! Inspect the column list for each table in schema_context above "
+                                f"and use ONLY columns that are explicitly declared."
+                            )
+                        if len(attempted_sql) > 1:
+                            error_for_repair += (
+                                f"\n\nNote: previous repair attempt tried:\n{attempted_sql[-1]}\n"
+                                f"and it failed — do not repeat that exact query."
+                            )
+
+                        try:
+                            repair_chain = self.llm_service.create_sql_repair_chain(dialect=dialect)
+                            repaired_sql = repair_chain.invoke({
+                                "Question": augmented_query,
+                                "schema_context": schema_context,
+                                "failed_sql": current_sql,
+                                "error_message": error_for_repair
+                            })
+                            output_tokens += self.count_tokens(str(repaired_sql))
+                            repaired_queries = extract_sql_queries(str(repaired_sql))
+                            if not repaired_queries:
+                                last_error = f"{last_error}\n(Repair attempt {attempt + 1} returned no valid SQL.)"
+                                break
+                            current_sql = repaired_queries[0]
+                            attempted_sql.append(current_sql)
+                            logging.info(f"[STEP 3] Repaired SQL (attempt {attempt + 1}):\n{current_sql}")
+                        except Exception as repair_err:
+                            last_error = f"{last_error}\nRepair error: {repair_err}"
+                            break
+
+                if last_error is not None:
+                    logging.error(f"[STEP 3] Q{i+1} failed after {max_repair_attempts} repair attempt(s): {last_error}")
+                    raise RuntimeError(
+                        f"Query execution failed and could not be auto-repaired after "
+                        f"{max_repair_attempts} attempt(s).\nLast error: {last_error}"
+                    )
+
+                logging.info(f"[STEP 3] Q{i+1} executed successfully.")
 
                 # Normalize result format
                 if isinstance(query_result, (list, dict)):
@@ -266,8 +323,12 @@ class QueryService:
             db_name = db_params.get("database", "unknown")
             dialect = self.db_service.db_type
 
-            # Fetch simplified schema
-            schema_context = self.db_service.get_simplified_schema()
+            # Fetch simplified schema (narrowed to relevant tables when possible)
+            allowed_tables, kw_tokens_in, kw_tokens_out = self._narrow_allowed_tables(user_query)
+            input_tokens += kw_tokens_in
+            output_tokens += kw_tokens_out
+
+            schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
             if not schema_context:
                 yield json.dumps({"type": "status", "content": "Falling back to database schema..."}) + "\n"
                 schema_context = self.db_service.get_simplified_schema()
@@ -326,43 +387,73 @@ class QueryService:
             if not sql_queries:
                 raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
 
-            # 4. SQL Execution (with one auto-repair retry)
+            # 4. SQL Execution (with bounded auto-repair retries)
+            max_repair_attempts = max(0, settings.sql_repair_max_attempts)
             yield json.dumps({"type": "status", "content": "Executing SQL and retrieving data..."}) + "\n"
             results = []
             final_sql_queries = list(sql_queries)
 
             for i, query in enumerate(final_sql_queries):
-                try:
-                    query_result = self.db_service.execute_query(query)
-                except Exception as exec_err:
-                    error_msg = str(exec_err)
-                    logging.warning(f"[STREAM] Q{i+1} failed: {error_msg}. Attempting auto-repair...")
-                    yield json.dumps({"type": "status", "content": f"Query execution failed: {error_msg}. Attempting auto-repair..."}) + "\n"
+                current_sql = query
+                attempted_sql = [query]
+                query_result = None
+                last_error = None
 
+                for attempt in range(max_repair_attempts + 1):
                     try:
-                        repair_chain = self.llm_service.create_sql_repair_chain(dialect=dialect)
-                        repaired_sql = await repair_chain.ainvoke({
-                            "Question": augmented_query,
-                            "schema_context": schema_context,
-                            "failed_sql": query,
-                            "error_message": error_msg
-                        })
-                        output_tokens += self.count_tokens(str(repaired_sql))
-                        repaired_queries = extract_sql_queries(str(repaired_sql))
-                        if repaired_queries:
-                            repaired_query = repaired_queries[0]
-                            logging.info(f"[STREAM] Repaired SQL:\n{repaired_query}")
-                            query_result = self.db_service.execute_query(repaired_query)
-                            final_sql_queries[i] = repaired_query
-                            logging.info(f"[STREAM] Repaired query executed successfully.")
-                        else:
-                            raise RuntimeError("Repair chain returned no valid SQL.")
-                    except Exception as repair_err:
-                        logging.error(f"[STREAM] Auto-repair also failed: {repair_err}")
-                        raise RuntimeError(
-                            f"Query execution failed and could not be auto-repaired.\n"
-                            f"Original error: {error_msg}\nRepair error: {repair_err}"
-                        )
+                        query_result = self.db_service.execute_query(current_sql)
+                        final_sql_queries[i] = current_sql
+                        last_error = None
+                        break
+                    except Exception as exec_err:
+                        last_error = str(exec_err)
+                        if attempt == max_repair_attempts:
+                            break
+
+                        logging.warning(f"[STREAM] Q{i+1} attempt {attempt + 1} failed: {last_error}. "
+                                         f"Attempting auto-repair ({attempt + 1}/{max_repair_attempts})...")
+                        yield json.dumps({"type": "status", "content": f"Query execution failed: {last_error}. Attempting auto-repair..."}) + "\n"
+
+                        invalid_ref = _extract_invalid_identifier_hint(last_error)
+                        error_for_repair = last_error
+                        if invalid_ref:
+                            error_for_repair += (
+                                f"\n\nCRITICAL HINT: The column/identifier '{invalid_ref}' DOES NOT EXIST in the schema! "
+                                f"DO NOT USE '{invalid_ref}' again! Inspect the column list for each table in schema_context above "
+                                f"and use ONLY columns that are explicitly declared."
+                            )
+                        if len(attempted_sql) > 1:
+                            error_for_repair += (
+                                f"\n\nNote: previous repair attempt tried:\n{attempted_sql[-1]}\n"
+                                f"and it failed — do not repeat that exact query."
+                            )
+
+                        try:
+                            repair_chain = self.llm_service.create_sql_repair_chain(dialect=dialect)
+                            repaired_sql = await repair_chain.ainvoke({
+                                "Question": augmented_query,
+                                "schema_context": schema_context,
+                                "failed_sql": current_sql,
+                                "error_message": error_for_repair
+                            })
+                            output_tokens += self.count_tokens(str(repaired_sql))
+                            repaired_queries = extract_sql_queries(str(repaired_sql))
+                            if not repaired_queries:
+                                last_error = f"{last_error}\n(Repair attempt {attempt + 1} returned no valid SQL.)"
+                                break
+                            current_sql = repaired_queries[0]
+                            attempted_sql.append(current_sql)
+                            logging.info(f"[STREAM] Repaired SQL (attempt {attempt + 1}):\n{current_sql}")
+                        except Exception as repair_err:
+                            last_error = f"{last_error}\nRepair error: {repair_err}"
+                            break
+
+                if last_error is not None:
+                    logging.error(f"[STREAM] Q{i+1} failed after {max_repair_attempts} repair attempt(s): {last_error}")
+                    raise RuntimeError(
+                        f"Query execution failed and could not be auto-repaired after "
+                        f"{max_repair_attempts} attempt(s).\nLast error: {last_error}"
+                    )
 
                 # Normalize result format
                 if isinstance(query_result, (list, dict)):
@@ -459,6 +550,52 @@ class QueryService:
             logging.error(f"Streaming query failed: {e}")
             yield json.dumps({"type": "error", "content": str(e)}) + "\n"
 
+    def _narrow_allowed_tables(self, user_query: str) -> Tuple[Optional[List[str]], int, int]:
+        """Narrow the schema sent to the LLM down to tables relevant to the question.
+
+        get_simplified_schema() caps out at 50 tables (alphabetical order) when
+        unfiltered — on a database with hundreds of tables, whatever the question
+        actually needs may never be alphabetically early enough to be included, and
+        the LLM silently gets no visibility into it at all (no error — it just isn't
+        there), which leads to hallucinated table/column names in the generated SQL.
+
+        Returns (allowed_tables, input_tokens_used, output_tokens_used). Returns
+        (None, 0, 0) — i.e. no narrowing, falls back to the default unfiltered
+        behavior — whenever the table count is small enough that narrowing isn't
+        needed, or if anything in this best-effort step fails.
+        """
+        try:
+            all_tables = self.db_service.get_table_names()
+        except Exception as e:
+            logging.warning(f"[STEP 1] Could not fetch table names for narrowing: {e}")
+            return None, 0, 0
+
+        if not all_tables or len(all_tables) <= 50:
+            return None, 0, 0
+
+        try:
+            keyword_chain = self.llm_service.create_keyword_extraction_chain()
+            in_tokens = self.count_tokens(user_query)
+            keywords_raw = keyword_chain.invoke({"Question": user_query})
+            out_tokens = self.count_tokens(str(keywords_raw))
+            keywords = [k.strip().lower() for k in str(keywords_raw).split(",") if k.strip()]
+        except Exception as e:
+            logging.warning(f"[STEP 1] Keyword extraction for schema narrowing failed: {e}")
+            return None, 0, 0
+
+        if not keywords:
+            return None, in_tokens, out_tokens
+
+        matched = [t for t in all_tables if any(kw in t.lower() for kw in keywords)]
+        if not matched:
+            logging.warning(f"[STEP 1] No tables matched narrowing keywords {keywords} out of "
+                             f"{len(all_tables)} table(s) — falling back to unfiltered schema.")
+            return None, in_tokens, out_tokens
+
+        logging.info(f"[STEP 1] Narrowed schema from {len(all_tables)} to {len(matched)} "
+                     f"table(s) via keywords {keywords}: {matched}")
+        return matched, in_tokens, out_tokens
+
     def _detect_meta_query(self, query: str) -> bool:
         """Detect if the query is asking about the database structure itself (metadata)."""
         meta_keywords = [
@@ -551,7 +688,7 @@ class QueryService:
 
     def get_history(self, limit: int = 10, message_id: Optional[str] = None, session_id: Optional[str] = None, company_id: Optional[str] = None, task_id: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get query history. Falls back to MongoDB if available for persistent history."""
-        if self.mongodb_service and hasattr(self.mongodb_service, "is_ready") and self.mongodb_service.is_ready():
+        if self.mongodb_service:
             try:
                 mongo_history = self.mongodb_service.get_history(
                     limit=limit,
@@ -565,21 +702,7 @@ class QueryService:
                     return mongo_history
             except Exception as e:
                 print(f"[ERROR] Failed to fetch history from MongoDB: {e}")
-        elif self.mongodb_service:
-            try:
-                mongo_history = self.mongodb_service.get_history(
-                    limit=limit,
-                    message_id=message_id,
-                    session_id=session_id,
-                    company_id=company_id,
-                    task_id=task_id,
-                    user_id=user_id
-                )
-                if mongo_history:
-                    return mongo_history
-            except Exception as e:
-                pass
-        
+
         results = self.query_history
         if message_id:
             results = [r for r in results if r.get("message_id") == message_id]
@@ -599,10 +722,18 @@ class QueryService:
         self.query_history = []
     
     def get_result_by_index(self, index: int) -> Dict[str, Any]:
-        """Get query result by index from history"""
-        if index < 0 or index >= len(self.query_history):
-            raise ValueError(f"Invalid index {index}. History has {len(self.query_history)} items.")
-        return self.query_history[index]
+        """Get query result by index from history.
+
+        self.query_history is only populated within the lifetime of a single request
+        (a fresh QueryService is constructed per-request), so it's empty for any request
+        that didn't itself just run process_query/stream_query. Fall back to the same
+        persisted history get_history() reads, so sharing by index matches what the
+        history endpoint actually displays.
+        """
+        history = self.query_history or self.get_history(limit=1000)
+        if index < 0 or index >= len(history):
+            raise ValueError(f"Invalid index {index}. History has {len(history)} items.")
+        return history[index]
     
     def get_latest_result(self) -> Dict[str, Any]:
         """Get the latest query result"""

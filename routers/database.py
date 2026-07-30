@@ -215,6 +215,25 @@ async def get_database_schema(
             detail=f"Failed to get schema: {str(e)}"
         )
 
+@router.get("/schema-graph", response_model=Dict[str, Any], responses={400: {"model": ErrorResponse}})
+async def get_database_schema_graph(
+    db_service: Annotated[DatabaseService, Depends(get_db_service)],
+    current_user: Annotated[str, Depends(verify_token)]
+):
+    """Get structured schema (tables, columns, primary/foreign keys, row counts) for graphical rendering"""
+    if not db_service.is_connected():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Database not connected"
+        )
+    try:
+        return db_service.get_schema_dict()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to get schema graph: {str(e)}"
+        )
+
 @router.get("/status", response_model=ConnectionResponse)
 async def get_database_status(
     db_service: Annotated[DatabaseService, Depends(get_db_service)],

@@ -16,7 +16,9 @@ def convert_to_serializable(obj: Any) -> Any:
     if isinstance(obj, (datetime, date, time)):
         return obj.isoformat()
     elif isinstance(obj, Decimal):
-        return float(obj)
+        return round(float(obj), 2)
+    elif isinstance(obj, float):
+        return round(obj, 2)
     elif isinstance(obj, (bytes, bytearray)):
         try:
             return obj.decode('utf-8')
@@ -455,6 +457,47 @@ class DatabaseService:
         except Exception as e:
             raise RuntimeError(f"Query execution failed: {str(e)}")
 
+    def get_table_names(self) -> List[str]:
+        """Fetch just the list of table names (unqualified), cheap enough to run before
+        pulling full column definitions. Used to narrow get_simplified_schema()'s
+        allowed_tables on databases with hundreds+ of tables, where a full column dump
+        would blow past the LLM context budget and silently drop relevant tables."""
+        if not self.connected:
+            raise RuntimeError("Database not connected")
+        try:
+            with self.create_connection() as conn:
+                cursor = conn.cursor()
+                if self.db_type in ["mysql", "mariadb"]:
+                    cursor.execute(
+                        "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+                        (self.connection_params["database"],)
+                    )
+                    rows = cursor.fetchall()
+                    names = [r["table_name"] for r in rows]
+                elif self.db_type == "mssql":
+                    cursor.execute("SELECT TABLE_NAME as table_name FROM INFORMATION_SCHEMA.TABLES")
+                    rows = cursor.fetchall()
+                    names = [r["table_name"] if hasattr(r, "keys") else r[0] for r in rows]
+                elif self.db_type == "oracle":
+                    cursor.execute(
+                        """
+                        SELECT table_name FROM all_tables
+                        WHERE owner NOT IN ('SYS', 'SYSTEM', 'XDB', 'WMSYS', 'OJVMSYS', 'CTXSYS', 'ORDSYS', 'ORDDATA', 'MDSYS', 'OLAPSYS')
+                        """
+                    )
+                    rows = cursor.fetchall()
+                    names = [r[0] for r in rows]
+                else:
+                    cursor.execute(
+                        "SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')"
+                    )
+                    rows = cursor.fetchall()
+                    names = [r["table_name"] for r in rows]
+                cursor.close()
+                return names
+        except Exception as e:
+            raise RuntimeError(f"Fetching table names failed: {str(e)}")
+
     def get_simplified_schema(self, allowed_tables: Optional[List[str]] = None) -> str:
         if not self.connected:
             raise RuntimeError("Database not connected")
@@ -576,8 +619,13 @@ class DatabaseService:
                 tables.setdefault(k, []).append(r)
             except Exception:
                 continue
-        MAX_TABLES = 50
-        MAX_COLS = 60
+        # When allowed_tables narrows to a specific, small set of tables, allow far more
+        # tables/columns through than the unfiltered fallback case (a broad/meta query
+        # that gets the raw alphabetical dump) — otherwise wide tables (100s of columns)
+        # get silently cut down to MAX_COLS even after correctly being selected as relevant.
+        is_narrowed = allowed_tables is not None and allowed_tables != ["*"]
+        MAX_TABLES = 50 if not is_narrowed else max(50, len(allowed_tables))
+        MAX_COLS = 60 if not is_narrowed else 300
         lines: List[str] = []
         count_tables = 0
         
@@ -606,8 +654,9 @@ class DatabaseService:
             lines.append(f"{schema}.{table}: " + ", ".join(parts))
             count_tables += 1
         text = "\n".join(lines)
-        if len(text) > 16000:
-            text = text[:16000]
+        # No fixed char cap here — services/query.py already truncates the final
+        # schema_context against settings.llm_max_context_chars. A second, smaller
+        # hardcoded cap here would silently override that configured budget.
         if use_cache:
             try:
                 self._schema_cache[key] = {"text": text, "generated_at": datetime.now()}

@@ -73,6 +73,10 @@ class HealthCheck(BaseModel):
     llm_configured: bool = Field(..., description="LLM configuration status")
     mongodb_connected: bool = Field(..., description="MongoDB connection status")
     timestamp: datetime = Field(..., description="Check timestamp")
+    database_name: Optional[str] = Field(None, description="Connected database name")
+    db_type: Optional[str] = Field(None, description="Connected database type")
+    db_host: Optional[str] = Field(None, description="Connected database host")
+    llm_model: Optional[str] = Field(None, description="Configured LLM model name")
 
 class ShareRequest(BaseModel):
     expiry_hours: Optional[int] = Field(24, description="Hours until the shared result expires", ge=1, le=168)

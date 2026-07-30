@@ -128,12 +128,19 @@ async def health_check():
         llm_service = service_registry.get_llm_service()
         mongodb_service = service_registry.get_mongodb_service()
         
+        db_params = db_service.get_connection_params() if db_service.is_connected() else {}
+        llm_details = llm_service.get_config_details() if llm_service.is_configured() else {}
+        
         return HealthCheck(
             status="healthy",
             database_connected=db_service.is_connected(),
             llm_configured=llm_service.is_configured(),
             mongodb_connected=mongodb_service.is_connected(),
-            timestamp=datetime.now()
+            timestamp=datetime.now(),
+            database_name=db_params.get("database") or settings.db_name,
+            db_type=db_service.db_type or settings.db_type,
+            db_host=db_params.get("host") or settings.db_host,
+            llm_model=llm_details.get("model") or settings.llm_model_name
         )
     except Exception:
         return HealthCheck(
@@ -141,7 +148,11 @@ async def health_check():
             database_connected=False,
             llm_configured=False,
             mongodb_connected=False,
-            timestamp=datetime.now()
+            timestamp=datetime.now(),
+            database_name=settings.db_name,
+            db_type=settings.db_type,
+            db_host=settings.db_host,
+            llm_model=settings.llm_model_name
         )
 
 @app.get("/config", tags=["config"])

@@ -1,11 +1,33 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from typing import Annotated, List
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from typing import Annotated, List, Optional
+from pydantic import BaseModel, Field
 
-from schemas import SharedResult, SharedResultMetadata
+from schemas import SharedResult, SharedResultMetadata, QueryResult, ShareResponse
 from services.sharing import SharingService
 from dependencies import get_sharing_service
 
 router = APIRouter(prefix="/sharing", tags=["sharing"])
+
+class CreateShareRequest(BaseModel):
+    result: QueryResult
+    expiry_hours: Optional[int] = Field(24, description="Hours until the shared result expires", ge=1, le=168)
+
+@router.post("/", response_model=ShareResponse)
+async def create_share(
+    payload: CreateShareRequest,
+    request: Request,
+    sharing_service: Annotated[SharingService, Depends(get_sharing_service)]
+):
+    """Share an already-computed query result directly (e.g. from the chat UI or client-side history),
+    without depending on the server's own (per-request, often-empty) query history index."""
+    share_id = sharing_service.share_result(payload.result.model_dump(), payload.expiry_hours)
+    shared_data = sharing_service.get_shared_result(share_id)
+    base_url = str(request.base_url).rstrip('/')
+    return ShareResponse(
+        share_id=share_id,
+        share_url=f"{base_url}/sharing/{share_id}",
+        expires_at=shared_data["expires_at"]
+    )
 
 @router.get("/{share_id}", response_model=SharedResult)
 async def get_shared_result(

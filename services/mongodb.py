@@ -374,10 +374,12 @@ class MongoDBService:
             for doc in cursor:
                 if "_id" in doc:
                     doc["_id"] = str(doc["_id"])
-                # Convert any datetime objects to strings
+                # Convert any datetime objects to strings, round floats to 2 decimals
                 for key, value in doc.items():
                     if isinstance(value, datetime):
                         doc[key] = value.isoformat()
+                    elif isinstance(value, float):
+                        doc[key] = round(value, 2)
                 results.append(doc)
             
             return results
@@ -387,28 +389,47 @@ class MongoDBService:
     # ========================================================================
     # Legacy methods for backward compatibility with existing functionality
     # ========================================================================
+    #
+    # These persist/read query history in the app's own settings.mongo_uri/mongo_db_name
+    # "query_results" collection. They deliberately open a short-lived connection per call
+    # via _open_history_collection() rather than reusing self.client/db/collection, because
+    # those attributes are freely reassigned by connect()/select_database()/select_collection()
+    # /disconnect() whenever a user points this service at their own MongoDB for NL2Query
+    # browsing — sharing that state silently redirected history reads/writes to whatever
+    # collection the user happened to be browsing.
+
+    def _open_history_collection(self, timeout_ms: int = 5000):
+        """Open a short-lived connection to the app's own history store.
+
+        Caller is responsible for closing the returned client. Returns (client, collection).
+        """
+        client = MongoClient(settings.mongo_uri, serverSelectionTimeoutMS=timeout_ms)
+        collection = client[settings.mongo_db_name]["query_results"]
+        return client, collection
+
+    def is_ready(self) -> bool:
+        """Whether the app's own history store is reachable, independent of whatever
+        external MongoDB the user has connected via connect()/select_database()."""
+        client = None
+        try:
+            client, _ = self._open_history_collection(timeout_ms=2000)
+            client.admin.command('ping')
+            return True
+        except Exception:
+            return False
+        finally:
+            if client:
+                client.close()
 
     def save_result(self, result: Dict[str, Any]) -> str:
-        """Save query result to MongoDB (legacy method)"""
-        if not self.is_connected():
-            # Try to reconnect using legacy method
-            self._legacy_connect()
-            if not self.is_connected():
-                print("Warning: MongoDB not connected, result not saved.")
-                return None
-        
+        """Save query result to the history store (legacy method)"""
+        client = None
         try:
-            # Ensure we have a collection to save to
-            if self.collection is None:
-                # Default to query_results collection
-                if self.db is None:
-                    self.db = self.client[self.current_database or "admin"]
-                self.collection = self.db["query_results"]
-                self.current_collection = "query_results"
-            
+            client, collection = self._open_history_collection()
+
             # Create a deep copy to avoid modifying the original result
             result_copy = deepcopy(result)
-            
+
             # Ensure timestamp is datetime object for MongoDB
             if "timestamp" in result_copy and isinstance(result_copy["timestamp"], str):
                 try:
@@ -419,24 +440,21 @@ class MongoDBService:
                 result_copy["timestamp"] = datetime.now()
 
             # Insert document
-            inserted_id = self.collection.insert_one(result_copy).inserted_id
+            inserted_id = collection.insert_one(result_copy).inserted_id
             return str(inserted_id)
         except Exception as e:
             print(f"Error saving to MongoDB: {e}")
             return None
+        finally:
+            if client:
+                client.close()
 
     def get_history(self, limit: int = 10, message_id: Optional[str] = None, session_id: Optional[str] = None, company_id: Optional[str] = None, task_id: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get history of queries from MongoDB with optional filters"""
-        if not self.is_connected():
-            return []
-        
+        """Get history of queries from the history store, with optional filters"""
+        client = None
         try:
-            # Ensure we have a collection
-            if self.collection is None:
-                if self.db is None:
-                    self.db = self.client[self.current_database or "admin"]
-                self.collection = self.db["query_results"]
-            
+            client, collection = self._open_history_collection()
+
             # Build filter dict
             query_filter = {}
             if message_id:
@@ -449,8 +467,8 @@ class MongoDBService:
                 query_filter["task_id"] = task_id
             if user_id:
                 query_filter["user_id"] = user_id
-                
-            cursor = self.collection.find(query_filter).sort("timestamp", -1).limit(limit)
+
+            cursor = collection.find(query_filter).sort("timestamp", -1).limit(limit)
             results = []
             for doc in cursor:
                 doc["_id"] = str(doc["_id"])
@@ -459,26 +477,23 @@ class MongoDBService:
         except Exception as e:
             print(f"Error fetching history from MongoDB: {e}")
             return []
+        finally:
+            if client:
+                client.close()
 
     def enable_sharing(self, doc_id: str, expiry_hours: int = 24) -> Dict[str, Any]:
-        """Enable sharing for a MongoDB document (legacy method)"""
-        if not self.is_connected():
-            raise RuntimeError("MongoDB not connected")
-        
+        """Enable sharing for a history document (legacy method)"""
+        client = None
         try:
             from bson.objectid import ObjectId
             from datetime import timedelta
-            
-            # Ensure we have a collection
-            if self.collection is None:
-                if self.db is None:
-                    self.db = self.client[self.current_database or "admin"]
-                self.collection = self.db["query_results"]
-            
+
+            client, collection = self._open_history_collection()
+
             expires_at = datetime.now() + timedelta(hours=expiry_hours)
-            
+
             # Update document to enable sharing
-            result = self.collection.update_one(
+            result = collection.update_one(
                 {"_id": ObjectId(doc_id)},
                 {"$set": {
                     "share_enabled": True,
@@ -486,64 +501,64 @@ class MongoDBService:
                     "share_created_at": datetime.now()
                 }}
             )
-            
+
             if result.matched_count == 0:
                 raise ValueError(f"Document {doc_id} not found")
-            
+
             # Return the updated document info
-            doc = self.collection.find_one({"_id": ObjectId(doc_id)})
+            doc = collection.find_one({"_id": ObjectId(doc_id)})
             doc["_id"] = str(doc["_id"])
             return doc
-            
+
         except Exception as e:
             print(f"Error enabling sharing: {e}")
             raise
+        finally:
+            if client:
+                client.close()
 
     def get_shared_result(self, doc_id: str) -> Dict[str, Any]:
-        """Get a shared result by MongoDB ID (legacy method)"""
-        if not self.is_connected():
-            return None
-        
+        """Get a shared result by its history document ID (legacy method)"""
+        client = None
         try:
             from bson.objectid import ObjectId
-            
-            # Ensure we have a collection
-            if self.collection is None:
-                if self.db is None:
-                    self.db = self.client[self.current_database or "admin"]
-                self.collection = self.db["query_results"]
-            
+
+            client, collection = self._open_history_collection()
+
             # Find document and check permissions/expiry
-            doc = self.collection.find_one({"_id": ObjectId(doc_id)})
-            
+            doc = collection.find_one({"_id": ObjectId(doc_id)})
+
             if not doc or not doc.get("share_enabled", False):
                 return None
-            
+
             # Check if expired
             expires_at = doc.get("share_expires_at")
             if expires_at and datetime.now() > expires_at:
                 # Cleanup expired share
-                self.collection.update_one(
+                collection.update_one(
                     {"_id": ObjectId(doc_id)},
                     {"$set": {"share_enabled": False}}
                 )
                 return None
-            
+
             # Log access
-            self.collection.update_one(
+            collection.update_one(
                 {"_id": ObjectId(doc_id)},
                 {
                     "$inc": {"access_count": 1},
                     "$set": {"last_accessed": datetime.now()}
                 }
             )
-            
+
             doc["_id"] = str(doc["_id"])
             return doc
-            
+
         except Exception as e:
             print(f"Error getting shared result: {e}")
             return None
+        finally:
+            if client:
+                client.close()
     def push_postgres_schema(self, schema_data: Dict[str, Any]) -> str:
         """Push a PostgreSQL schema definition into MongoDB with Smart Update (Upsert)"""
         try:

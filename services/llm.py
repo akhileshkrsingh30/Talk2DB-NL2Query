@@ -86,8 +86,11 @@ class LLMService:
             is_local_or_ollama = (
                 "localhost" in base_url
                 or "127.0.0.1" in base_url
+                or "10." in base_url
+                or "192.168." in base_url
+                or "172.1" in base_url
                 or "ollama" in api_key.lower()
-                or api_key.lower() in ["ollama", "none", "local"]
+                or api_key.lower() in ["ollama", "none", "not-needed", "empty", "local"]
             )
             
             if validate_key and not is_local_or_ollama:
@@ -232,8 +235,9 @@ The ONLY tables and columns you are allowed to use:
 Follow these steps in your head before writing the final SQL:
 
 STEP 1 — UNDERSTAND
-- What data does the user want? (rows, aggregates, trends, comparisons?)
-- What filters, groupings, or sort orders are implied?
+- What data does the user want? (rows, aggregates, trends, comparisons, rankings, structural/metadata info?)
+- What filters, groupings, or sort orders are implied — including relative dates ("last month", "this quarter", "past 7 days"), fuzzy/partial text matches, and implicit "top/bottom N" phrasing?
+- If the question is ambiguous or underspecified, pick the most reasonable interpretation based on common business usage and proceed — do not stop or ask for clarification.
 
 STEP 2 — MAP TO SCHEMA
 - Which tables contain the required data?
@@ -243,32 +247,41 @@ STEP 2 — MAP TO SCHEMA
 
 STEP 3 — PLAN THE QUERY STRUCTURE
 - Simple lookup → plain SELECT with WHERE
-- Aggregation (count/sum/avg) → GROUP BY + HAVING
-- Multiple related tables → JOIN with explicit ON conditions
-- 3+ tables or self-referencing → use CTEs (WITH clauses) for readability
-- Rankings, running totals, percentages → use window functions (ROW_NUMBER, RANK, SUM OVER, etc.)
-- Time-series trends → GROUP BY date truncation (DATE_TRUNC for PostgreSQL)
+- Aggregation (count/sum/avg/min/max) → GROUP BY + HAVING
+- Multiple related tables → JOIN with explicit ON conditions (INNER/LEFT/RIGHT/FULL as the question implies)
+- 3+ tables, self-referencing, or reusable intermediate results → CTEs (WITH clauses) for readability
+- Hierarchical or recursive data (org charts, bill of materials, category trees, threads) → recursive CTE (WITH RECURSIVE or the dialect's equivalent)
+- Rankings, running totals, moving averages, percent-of-total → window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT OVER, LAG/LEAD)
+- Time-series trends or period bucketing → GROUP BY date truncation/formatting at the requested granularity (day/week/month/quarter/year), using the dialect's date-truncation function
+- Pivot-style breakdowns ("X by category as columns") → conditional aggregation with CASE WHEN inside SUM/COUNT/AVG
+- Existence / non-existence checks → EXISTS / NOT EXISTS, or LEFT JOIN ... IS NULL
+- Membership against a fixed set or subquery result → IN / NOT IN (prefer NOT EXISTS for large or nullable sets)
+- Combining or comparing multiple result sets → UNION / UNION ALL / INTERSECT / EXCEPT where the dialect supports it
+- Multi-level or grouped subtotals ("with subtotals/grand total") → ROLLUP / CUBE / GROUPING SETS where the dialect supports it
+- Free-text, partial, or fuzzy matches → LIKE/ILIKE, or the dialect's full-text search functions
+- Structural/metadata questions (list tables, describe columns, row counts) → query the schema-metadata context provided above if present
 
 STEP 4 — WRITE THE SQL
 Apply these quality rules:
 - Always alias tables (e.g., orders o, customers c)
-- Use COALESCE to handle NULLs in aggregations
+- Use COALESCE to handle NULLs in aggregations; use NULLIF to guard against division by zero
 - Add meaningful column aliases in SELECT (e.g., AS total_revenue)
-- Apply LIMIT 100 unless the question asks for all rows or a count
-- Use proper {dialect.upper()} syntax for date functions, string ops, and casting
-- For MSSQL use TOP instead of LIMIT; for Oracle use FETCH FIRST N ROWS ONLY
+- Apply LIMIT 100 only as a safety default for open-ended row listings — do NOT apply it when the question asks for all matching rows, a specific top-N/bottom-N count, a single aggregate/summary row, or any result that would legitimately exceed 100 rows
+- Use proper {dialect.upper()} syntax for date functions, string ops, casting, and row-limiting (e.g., MSSQL uses TOP, Oracle uses FETCH FIRST N ROWS ONLY, most others use LIMIT)
 
 STEP 5 — VERIFY
 - Every table referenced exists in the schema.
 - Every column referenced exists in its table.
 - All JOINs have matching data types on both sides.
 - No hallucinated table or column names.
+- The query shape actually matches what was asked (no unrequested LIMIT, no dropped filters/groupings).
 
 ## ABSOLUTE CONSTRAINTS
-1. Use ONLY tables and columns from the schema above. Zero exceptions.
-2. If the question cannot be answered from the given schema, return exactly:
+1. Use ONLY tables and columns explicitly listed in the schema above. Check each table's column list carefully — do NOT assume a 'date' or 'created_at' column exists on a table (such as 'orders') unless it is explicitly listed in that table's columns.
+2. Perform flexible schema inference: map business terms, synonyms, and related concepts (e.g. loans, awards, profile, activity, status) to the closest matching tables and columns available in the schema.
+3. Only if the question is completely unrelated to any table or column in the schema, return:
    SELECT 'Insufficient schema context to answer this question' AS message;
-3. Return ONLY the final raw SQL statement. No markdown, no ```, no explanation text.
+4. Return ONLY the final raw SQL statement. No markdown, no ```, no explanation text.
 
 SQL Query:"""
         )
@@ -295,13 +308,19 @@ SQL Query:"""
 {{error_message}}
 
 ## YOUR TASK
-Fix the SQL so it runs correctly. Common issues to check:
-- Column name typo → replace with exact name from schema
+Fix the SQL so it runs correctly. CRITICAL INSTRUCTIONS:
+- If error is "column X.column_name does not exist" (e.g. "column o.date does not exist"): Inspect table X in {{schema_context}}. If table X does NOT have that column (e.g., if 'orders' does NOT have a 'date' column), DO NOT use X.column_name! Use a table that actually contains a date column (e.g., 'account.date' or 'loan.date') or remove the invalid column reference.
+- Column name typo or mismatch → replace with exact name present in schema
 - Ambiguous column → qualify with table alias
 - Wrong JOIN key → use the correct foreign key from schema
 - Syntax error → fix to valid {dialect.upper()} syntax
 - Missing GROUP BY → add all non-aggregated SELECT columns
 - Type mismatch in JOIN or WHERE → cast appropriately
+- Aggregate function used in WHERE → move that condition to HAVING
+- Subquery returns more than one row → wrap with IN/EXISTS, or aggregate it down to one row
+- Division by zero → guard the denominator with NULLIF(denominator, 0)
+- Window function used directly in WHERE/HAVING → move the filter to an outer query wrapping the windowed SELECT
+- Dialect-specific function or row-limiting syntax not supported → substitute the correct {dialect.upper()} equivalent
 
 Return ONLY the corrected raw SQL. No explanation, no markdown.
 
@@ -381,22 +400,18 @@ STRICT FORMATTING RULES:
         """Create a chain to extract high-level keywords/entities for schema searching"""
         prompt = ChatPromptTemplate.from_template(
             """
-            You are a database expert and business analyst. Given a natural language question about an ERP database, 
-            extract the most important technical keywords and their common abbreviations to help find relevant tables.
-            
+            You are a database expert and business analyst. Given a natural language question about a database
+            in any domain, extract the most important technical keywords and their common abbreviations to help
+            find relevant tables.
+
             USER QUESTION: {Question}
-            
+
             RULES:
-            1. Extract nouns and entities (e.g., 'customer', 'invoice', 'ledger').
-            2. If you see 'General Ledger', include 'gl'.
-            3. If you see 'Accounts Payable', include 'ap'.
-            4. If you see 'Accounts Receivable', include 'ar'.
-            5. If you see 'Purchase Order', include 'po'.
-            6. If you see 'Goods Receipt', include 'grn'.
-            7. If you see 'Human Resources' or 'Employee', include 'hr'.
-            8. Include the schema name if mentioned (e.g., 'sales', 'finance').
-            9. Return ONLY a comma-separated list of keywords.
-            
+            1. Extract nouns and entities mentioned or implied by the question (e.g., 'customer', 'invoice', 'patient', 'shipment', 'enrollment', 'ledger').
+            2. For any multi-word business or technical term, also include its common industry abbreviation if one plausibly exists — infer this from general domain knowledge rather than a fixed list. Examples of the pattern (not an exhaustive list, and not limited to this domain): 'General Ledger' → gl, 'Accounts Payable' → ap, 'Accounts Receivable' → ar, 'Purchase Order' → po, 'Goods Receipt Note' → grn, 'Human Resources' → hr, 'Electronic Health Record' → ehr, 'Stock Keeping Unit' → sku, 'Customer Relationship Management' → crm, 'Key Performance Indicator' → kpi. Apply this same expansion logic to whatever domain the question is actually about (finance, healthcare, retail, logistics, education, manufacturing, SaaS, etc.).
+            3. Include the schema or module name if mentioned (e.g., 'sales', 'finance', 'clinical', 'inventory').
+            4. Return ONLY a comma-separated list of keywords.
+
             KEYWORDS:"""
         )
         return prompt | self.llm | StrOutputParser()
@@ -407,20 +422,21 @@ STRICT FORMATTING RULES:
             raise RuntimeError("LLM not configured.")
 
         prompt = ChatPromptTemplate.from_template(
-            """You are a database expert. Your task is to generate a MongoDB find() query to search for relevant tables in a PostgreSQL schema metadata collection.
-            
-            Metadata Collection Schema (collection: table_metadata):
+            """You are a database expert. Your task is to generate a MongoDB find() query to search for relevant tables in a schema metadata collection.
+
+            Metadata Collection Schema (collection: table_metadata; exact fields may vary slightly by deployment):
             - table: table name
-            - schema: schema name (usually 'public')
+            - schema: schema name (e.g. 'public', 'dbo')
             - database: database name
             - host: host name
             - column_names: array of strings (e.g., ["id", "name", "created_at"])
-            
+            - description / tags: optional free-text or keyword fields — if present in a given document, also match against them
+
             User's Question: {Question}
-            
+
             Instructions:
             - Return ONLY a valid JSON object used as the filter for MongoDB find().
-            - The filter should use $or and $regex to search in both "table" and "column_names".
+            - The filter should use $or and $regex to search across all relevant text fields (at minimum "table" and "column_names"; also "description"/"tags" if the question's terms look conceptual rather than literal).
             - Make the regex case-insensitive using $options: "i".
             - Only return the raw JSON object.
             
@@ -446,16 +462,21 @@ STRICT FORMATTING RULES:
             Question: {Question}
 
             CRITICAL RULES:
-            - Return ONLY a valid JSON object with two keys: "filter" and "projection"
+            - Return ONLY a valid JSON object with keys: "filter", "projection", and optionally "sort" and "limit"
             - "filter" is the MongoDB query filter (the first argument to find())
             - "projection" is the fields to return (the second argument to find()). Use 1 to include, 0 to exclude. Always exclude "_id" unless specifically asked.
-            - Use ONLY the exact field names from the schema above
-            - For geospatial queries, use native MongoDB operators like $near, $nearSphere, $geoWithin, or $geoIntersects if the schema contains 2dsphere indexes or coordinates. 
+            - Use ONLY the exact field names from the schema above, including dot-notation for nested/embedded fields (e.g., "address.city")
+            - Combine multiple conditions with $and / $or / $nor as the question requires
+            - For membership against a list of values, use $in / $nin
+            - For array fields, use $all (contains all values), $elemMatch (element matching multiple conditions), and $size (array length)
+            - For field presence or type checks, use $exists and $type
+            - For free-text search across a field, use $regex with $options: "i" for case-insensitive partial/fuzzy matching; if the schema indicates a text index, $text with $search is also acceptable
+            - For numeric or date comparisons use $gt, $gte, $lt, $lte, $eq, $ne (date ranges: combine $gte/$lte on the date field, resolving relative phrases like "last month" or "past 7 days" to concrete ISO date bounds)
+            - For cross-field or computed comparisons, use $expr
+            - For geospatial queries, use native MongoDB operators like $near, $nearSphere, $geoWithin, or $geoIntersects if the schema contains 2dsphere indexes or coordinates.
             - If calculating distance manually via $expr, keep the formula as concise as possible to avoid truncation.
-            - For string matching, use $regex with $options: "i" for case-insensitive
-            - For numeric comparisons use $gt, $gte, $lt, $lte, $eq, $ne
-            - For sorting, add a "sort" key with field and direction (1=asc, -1=desc)
-            - For limiting results, add a "limit" key with an integer value
+            - For sorting, add a "sort" key with field and direction (1=asc, -1=desc); multiple sort keys are allowed
+            - For limiting results, add a "limit" key with an integer value; omit it (or use a generous value) when the question asks for all matching documents
             - Do NOT wrap the JSON in markdown code blocks or backticks
             - Return ONLY the raw JSON object, nothing else
             - ENSURE the JSON is complete and valid.
