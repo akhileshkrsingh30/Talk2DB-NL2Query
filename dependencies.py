@@ -11,7 +11,6 @@ from services.llm import LLMService
 from services.sharing import SharingService
 from services.mongodb import MongoDBService
 from services.billing.billing_service import BillingService
-from services.mem0_service import Mem0Service
 from config import settings
 import os
 
@@ -124,13 +123,6 @@ def get_mongodb_service() -> MongoDBService:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
-
-def get_mem0_service() -> Mem0Service:
-    """Dependency to get Mem0 service instance (Stub/Disabled)"""
-    try:
-        return service_registry.get_mem0_service()
-    except Exception:
-        return Mem0Service()
 
 
 def get_user_id_from_token(token: str) -> Optional[str]:

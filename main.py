@@ -25,13 +25,12 @@ from datetime import datetime
 import os
 
 from config import settings
-from routers import database, queries, sharing, llm_config, mongodb, rbac, memories
+from routers import database, queries, sharing, llm_config, mongodb
 from services.database import DatabaseService
 from services.llm import LLMService
 from services.sharing import SharingService
 from services.billing.billing_service import BillingService
 from services.mongodb import MongoDBService
-from services.mem0_service import Mem0Service
 from services.registry import service_registry
 from schemas import HealthCheck
 from dependencies import verify_token
@@ -47,7 +46,6 @@ async def lifespan(app: FastAPI):
     sharing_service = SharingService()
     billing_service = BillingService()
     mongodb_service = MongoDBService()
-    mem0_service = Mem0Service()
     
     # Register services in the registry
     service_registry.set_db_service(db_service)
@@ -55,13 +53,6 @@ async def lifespan(app: FastAPI):
     service_registry.set_sharing_service(sharing_service)
     service_registry.set_billing_service(billing_service)
     service_registry.set_mongodb_service(mongodb_service)
-    service_registry.set_mem0_service(mem0_service)
-    
-    # Initialize Mem0
-    try:
-        mem0_service.initialize()
-    except Exception as e:
-        print(f"Mem0 initialization warning/error: {e}")
 
     # 2. Try to auto-connect to database
     if all([settings.db_host, settings.db_port, settings.db_name, settings.db_user]):
@@ -131,8 +122,6 @@ api_router.include_router(mongodb.router, dependencies=[Depends(verify_token)])
 api_router.include_router(queries.router, dependencies=[Depends(verify_token)])
 api_router.include_router(sharing.router, dependencies=[Depends(verify_token)])
 api_router.include_router(llm_config.router, dependencies=[Depends(verify_token)])
-api_router.include_router(rbac.router, dependencies=[Depends(verify_token)])
-api_router.include_router(memories.router, dependencies=[Depends(verify_token)])
 
 app.include_router(api_router)
 
@@ -142,8 +131,6 @@ app.include_router(mongodb.router, dependencies=[Depends(verify_token)])
 app.include_router(queries.router, dependencies=[Depends(verify_token)])
 app.include_router(sharing.router, dependencies=[Depends(verify_token)])
 app.include_router(llm_config.router, dependencies=[Depends(verify_token)])
-app.include_router(rbac.router, dependencies=[Depends(verify_token)])
-app.include_router(memories.router, dependencies=[Depends(verify_token)])
 
 frontend_dist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
 
@@ -229,22 +216,6 @@ def resolve_allowed_tables(allowed_pages: list) -> list:
     for page in allowed_pages:
         tables.update(PAGE_TO_TABLES.get(page, []))
     return sorted(tables)
-
-@app.api_route("/push-db-roles", methods=["GET", "POST"], tags=["rbac"])
-@app.api_route("/api/push-db-roles", methods=["GET", "POST"], tags=["rbac"])
-async def push_db_roles():
-    mem0_service = service_registry.get_mem0_service()
-    if not mem0_service or not mem0_service.is_ready():
-        return {"status": "error", "message": "Mem0 not ready"}
-        
-    try:
-        mem0_service.invalidate_cache()
-        return {
-            "status": "success",
-            "message": "RBAC cache invalidated. Permissions will be resolved dynamically from the database."
-        }
-    except Exception as err:
-        return {"status": "error", "message": f"Cache invalidation failed: {str(err)}"}
 
 # Serve frontend static distribution if available
 frontend_dist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")

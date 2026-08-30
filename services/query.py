@@ -14,12 +14,11 @@ from config import settings
 
 
 class QueryService:
-    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None, mem0_service = None):
+    def __init__(self, db_service: DatabaseService, llm_service: LLMService, billing_service: BillingService = None, mongodb_service = None):
         self.db_service = db_service
         self.llm_service = llm_service
         self.billing_service = billing_service
         self.mongodb_service = mongodb_service
-        self.mem0_service = mem0_service
         self.query_history = []
         try:
             self.encoding = tiktoken.get_encoding("cl100k_base")
@@ -85,7 +84,7 @@ class QueryService:
                       use_chat_history: bool = False, history_limit: int = 3,
                       include_explanation: bool = True) -> Dict[str, Any]:
         """Process natural language query and return results.
-        Flow: fetch Mem0 RBAC -> schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
+        Flow: schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
         """
         start_time = time.time()
 
@@ -94,7 +93,7 @@ class QueryService:
 
             logging.info(f"--- START PROCESSING QUERY: '{user_query[:80]}' ---")
 
-            # RBAC and Mem0 bypassed — Full administrative access to all tables
+            # Full administrative access to all tables
             permissions = {"role": "admin", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
 
             db_params = self.db_service.get_connection_params()
@@ -141,7 +140,7 @@ class QueryService:
             logging.info(f"[STEP 2] Generating {dialect.upper()} SQL...")
             sql_gen_chain = self.llm_service.create_sql_generation_chain(dialect=dialect)
 
-            # Inject Row-level Filter constraints from Mem0
+            # Inject Row-level Filter constraints
             augmented_query = user_query
             if permissions.get("role") != "admin" and permissions.get("row_filters"):
                 filter_str = " AND ".join(permissions["row_filters"])
@@ -230,8 +229,6 @@ class QueryService:
                             if re.search(rf"\b{re.escape(table)}\b", sql, re.IGNORECASE):
                                 error_msg_rbac = f"Access Denied: You do not have permission to query table."
                                 logging.warning(f"[RBAC] BLOCKED user={user_id} | table='{table}' | sql={sql[:80]}")
-                                if self.mem0_service:
-                                    self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                                 raise ValueError(error_msg_rbac)
             elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
                 for sql in sql_queries:
@@ -239,8 +236,6 @@ class QueryService:
                         if re.search(rf"\b{restricted_table}\b", sql, re.IGNORECASE):
                             error_msg_rbac = f"Access Denied: Query attempts to read restricted table ."
                             logging.warning(f"[RBAC] User {user_id} blocked: restricted table '{restricted_table}'.")
-                            if self.mem0_service:
-                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                             raise ValueError(error_msg_rbac)
 
             # ── STEP 3: Execute SQL (with one auto-repair retry) ────────────────
@@ -279,8 +274,6 @@ class QueryService:
                                         if re.search(rf"\b{re.escape(table)}\b", repaired_query, re.IGNORECASE):
                                             error_msg_rbac = f"Access Denied: You do not have permission to query table."
                                             logging.warning(f"[RBAC] BLOCKED user={user_id} | table='{table}' | sql={repaired_query[:80]}")
-                                            if self.mem0_service:
-                                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                                             raise ValueError(error_msg_rbac)
 
                             if permissions.get("role") != "admin" and permissions.get("restricted_tables"):
@@ -288,8 +281,6 @@ class QueryService:
                                     if re.search(rf"\b{restricted_table}\b", repaired_query, re.IGNORECASE):
                                         error_msg_rbac = f"Access Denied: Repaired query attempts to read restricted table ."
                                         logging.warning(f"[RBAC] User {user_id} blocked: repaired query tried to access restricted table '{restricted_table}'. SQL: {repaired_query}")
-                                        if self.mem0_service:
-                                            self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                                         raise ValueError(error_msg_rbac)
                                         
                             query_result = self.db_service.execute_query(repaired_query)
@@ -329,9 +320,7 @@ class QueryService:
                 explanation = ""
             logging.info("--- FINISHED PROCESSING QUERY ---")
 
-            # Audit successful execution in Mem0
-            if self.mem0_service:
-                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Success")
+
 
             # ── Build response ──────────────────────────────────────────────────
             execution_time = time.time() - start_time
@@ -405,51 +394,8 @@ class QueryService:
             self.validate_prerequisites()
             yield json.dumps({"type": "status", "content": "Analyzing query and discovering schema..."}) + "\n"
             
-            # Fetch Mem0 Permissions
-            permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-            if self.mem0_service:
-                if user_id:
-                    permissions = self.mem0_service.get_user_permissions(user_id)
-                    logging.info(f"[RBAC] [STREAM] Active permissions from Mem0: {permissions}")
-                    print(f"[Mem0 RBAC Return] [STREAM] Active permissions for user {user_id}: {permissions}")
-                
-                # Fetch task mapping if task_id is provided
-                if task_id:
-                    try:
-                        memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
-                        print(f"[Mem0 Raw Return] [STREAM] Raw memories fetched from Mem0: {memories}")
-                        task_tables = None
-                        for m in memories:
-                            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                            if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                                print(f"[Mem0 Matched Memory] [STREAM] Found task mapping in Mem0: {m}")
-                                raw_tables = meta.get("tables", "[]")
-                                try:
-                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                                except Exception:
-                                    task_tables = []
-                                break
-                        
-                        if task_tables is not None:
-                            logging.info(f"[Task Security] Enforcing task {task_id} allowed tables: {task_tables}")
-                            # Override allowed_tables to restrict to the task's allowed tables
-                            if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                                u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                                t_allowed = {t.lower() for t in task_tables}
-                                permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                            else:
-                                permissions["allowed_tables"] = task_tables
-                            print(f"[Mem0 Tables] [STREAM] task_id: {task_id} | Allowed tables sent to LLM: {permissions['allowed_tables']}")
-                        else:
-                            logging.warning(f"[Task Security] Task {task_id} not found in Mem0. Access defaults to all tables.")
-                            permissions["allowed_tables"] = ["*"]
-                            print(f"[Mem0 Tables] [STREAM] task_id: {task_id} not found in Mem0 | Defaults sent to LLM: {permissions['allowed_tables']}")
-                    except Exception as task_err:
-                        logging.error(f"[Task Security] Failed to lookup task {task_id}: {task_err}")
-                else:
-                    # if no task_id then allowed all the table by default
-                    permissions["allowed_tables"] = ["*"]
-                    permissions["restricted_tables"] = []
+            # Full administrative access to all tables
+            permissions = {"role": "admin", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
 
             db_params = self.db_service.get_connection_params()
             db_name = db_params.get("database", "unknown")
@@ -553,8 +499,6 @@ class QueryService:
                             if re.search(rf"\b{re.escape(table)}\b", sql, re.IGNORECASE):
                                 error_msg_rbac = f"Access Denied: You do not have permission to query table."
                                 logging.warning(f"[RBAC] [STREAM] BLOCKED user={user_id} | table='{table}' | sql={sql[:80]}")
-                                if self.mem0_service:
-                                    self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                                 raise ValueError(error_msg_rbac)
             elif permissions.get("role") != "admin" and permissions.get("restricted_tables"):
                 for sql in sql_queries:
@@ -562,8 +506,6 @@ class QueryService:
                         if re.search(rf"\b{restricted_table}\b", sql, re.IGNORECASE):
                             error_msg_rbac = f"Access Denied: Query attempts to read restricted table ."
                             logging.warning(f"[RBAC] [STREAM] User {user_id} blocked: restricted table '{restricted_table}'.")
-                            if self.mem0_service:
-                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                             raise ValueError(error_msg_rbac)
 
             # 4. SQL Execution (with one auto-repair retry)
@@ -602,8 +544,6 @@ class QueryService:
                                         if re.search(rf"\b{re.escape(table)}\b", repaired_query, re.IGNORECASE):
                                             error_msg_rbac = f"Access Denied: You do not have permission to query table."
                                             logging.warning(f"[RBAC] [STREAM] BLOCKED user={user_id} | table='{table}' | sql={repaired_query[:80]}")
-                                            if self.mem0_service:
-                                                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                                             raise ValueError(error_msg_rbac)
 
                             if permissions.get("role") != "admin" and permissions.get("restricted_tables"):
@@ -611,8 +551,6 @@ class QueryService:
                                     if re.search(rf"\b{restricted_table}\b", repaired_query, re.IGNORECASE):
                                         error_msg_rbac = f"Access Denied: Repaired query attempts to read restricted table ."
                                         logging.warning(f"[RBAC] [STREAM] User {user_id} blocked: repaired query tried to access restricted table '{restricted_table}'.")
-                                        if self.mem0_service:
-                                            self.mem0_service.add_audit_log(user_id, session_id, user_query, "Access Denied")
                                         raise ValueError(error_msg_rbac)
                                         
                             query_result = self.db_service.execute_query(repaired_query)
@@ -661,9 +599,7 @@ class QueryService:
                 logging.info("[STREAM] Explanation generation disabled by request — skipping.")
                 yield json.dumps({"type": "explanation_start"}) + "\n"
             
-            # Audit successful execution in Mem0
-            if self.mem0_service:
-                self.mem0_service.add_audit_log(user_id, session_id, user_query, "Success")
+
 
             # Calculate billing info
             execution_time = time.time() - start_time
