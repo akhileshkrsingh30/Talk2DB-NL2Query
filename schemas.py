@@ -30,6 +30,9 @@ class QueryRequest(BaseModel):
     temperature: Optional[float] = Field(0.0, description="Temperature for LLM generation")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
     task_id: Optional[int] = Field(None, description="Optional task ID to restrict query execution to the tables mapped to this task")
+    use_chat_history: Optional[bool] = Field(False, description="If true, include condensed context from prior turns of this session (session_id) when generating SQL")
+    history_limit: Optional[int] = Field(3, ge=1, le=10, description="Number of prior turns to consider when use_chat_history is enabled")
+    include_explanation: Optional[bool] = Field(True, description="If false, skip natural language explanation generation to reduce token usage")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")

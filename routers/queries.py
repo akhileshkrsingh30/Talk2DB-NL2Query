@@ -52,7 +52,10 @@ async def process_natural_language_query(
             message_id=query_request.message_id,
             company_id=query_request.company_id,
             background_tasks=background_tasks,
-            task_id=query_request.task_id
+            task_id=query_request.task_id,
+            use_chat_history=query_request.use_chat_history,
+            history_limit=query_request.history_limit,
+            include_explanation=query_request.include_explanation
         )
         return result
         
@@ -104,7 +107,10 @@ async def stream_natural_language_query(
             session_id=query_request.session_id,
             message_id=query_request.message_id,
             company_id=query_request.company_id,
-            task_id=query_request.task_id
+            task_id=query_request.task_id,
+            use_chat_history=query_request.use_chat_history,
+            history_limit=query_request.history_limit,
+            include_explanation=query_request.include_explanation
         ),
         headers=headers
     )
@@ -156,7 +162,10 @@ async def process_natural_language_query_batch(
                         message_id=q.message_id,
                         company_id=q.company_id,
                         background_tasks=background_tasks,
-                        task_id=item_task_id
+                        task_id=item_task_id,
+                        use_chat_history=q.use_chat_history,
+                        history_limit=q.history_limit,
+                        include_explanation=q.include_explanation
                     )
                 except Exception as e:
                     # Return a partial failure result instead of crashing
@@ -200,7 +209,10 @@ async def process_natural_language_query_batch(
                         message_id=item.message_id,
                         company_id=item.company_id,
                         background_tasks=background_tasks,
-                        task_id=item_task_id
+                        task_id=item_task_id,
+                        use_chat_history=item.use_chat_history,
+                        history_limit=item.history_limit,
+                        include_explanation=item.include_explanation
                     )
                     results.append(res)
                 except Exception as e:
@@ -280,9 +292,12 @@ async def process_and_share_query(
             user_id=current_user,
             session_id=query_request.session_id,
             background_tasks=background_tasks,
-            task_id=query_request.task_id
+            task_id=query_request.task_id,
+            use_chat_history=query_request.use_chat_history,
+            history_limit=query_request.history_limit,
+            include_explanation=query_request.include_explanation
         )
-        
+
         # Share the result
         share_id = sharing_service.share_result(result, share_request.expiry_hours)
         

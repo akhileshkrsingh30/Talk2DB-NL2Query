@@ -453,6 +453,29 @@ class DatabaseService:
                         }
                         
         except Exception as e:
+            err_msg = str(e)
+            if "columns with no names" in err_msg and self.db_type == "mssql":
+                logging.info("   [Fallback] Handling un-aliased MSSQL columns via tuple cursor...")
+                try:
+                    with pymssql.connect(
+                        server=self.connection_params["host"],
+                        port=self.connection_params["port"],
+                        user=self.connection_params["user"],
+                        password=self.connection_params["password"],
+                        database=self.connection_params["database"] or "master",
+                        as_dict=False
+                    ) as raw_conn:
+                        with raw_conn.cursor() as raw_cursor:
+                            raw_cursor.execute(sql_query)
+                            description = raw_cursor.description
+                            col_names = [col[0] if (col and col[0]) else f"col_{i+1}" for i, col in enumerate(description)] if description else []
+                            rows = raw_cursor.fetchall()
+                            dict_results = [dict(zip(col_names, row)) for row in rows]
+                            elapsed = time.time() - start_time
+                            logging.info(f"   [OK Fallback] DB Response: {len(dict_results)} rows in {elapsed:.3f}s")
+                            return dict_results
+                except Exception as fallback_err:
+                    raise RuntimeError(f"Query execution failed: {str(fallback_err)}")
             raise RuntimeError(f"Query execution failed: {str(e)}")
 
     def get_simplified_schema(self, allowed_tables: Optional[List[str]] = None) -> str:
@@ -576,8 +599,8 @@ class DatabaseService:
                 tables.setdefault(k, []).append(r)
             except Exception:
                 continue
-        MAX_TABLES = 50
-        MAX_COLS = 60
+        MAX_TABLES = 200
+        MAX_COLS = 150
         lines: List[str] = []
         count_tables = 0
         
@@ -606,8 +629,9 @@ class DatabaseService:
             lines.append(f"{schema}.{table}: " + ", ".join(parts))
             count_tables += 1
         text = "\n".join(lines)
-        if len(text) > 16000:
-            text = text[:16000]
+        max_context = getattr(settings, "llm_max_context_chars", 200000)
+        if len(text) > max_context:
+            text = text[:max_context]
         if use_cache:
             try:
                 self._schema_cache[key] = {"text": text, "generated_at": datetime.now()}

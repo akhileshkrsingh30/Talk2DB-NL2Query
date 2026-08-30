@@ -42,11 +42,14 @@ def extract_sql_queries(text: str) -> List[str]:
         if any(upper.startswith(k) for k in sql_keywords):
             queries = [text]
 
-    # Clean up: strip trailing semicolons and whitespace
+    # Clean up: strip trailing semicolons and whitespace, and deduplicate
     cleaned = []
+    seen = set()
     for q in queries:
         q = q.strip().rstrip(";").strip()
-        if q:
+        normalized = re.sub(r'\s+', ' ', q.lower())
+        if q and normalized not in seen:
+            seen.add(normalized)
             cleaned.append(q)
 
     return cleaned

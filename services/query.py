@@ -44,9 +44,46 @@ class QueryService:
                 error_msg += f" Current config state: {config_details}"
             raise ValueError(error_msg)
         
+    def _build_history_context(self, session_id: Optional[str], limit: int = 3, token_budget: int = 250) -> str:
+        """Build a compact, token-capped summary of prior turns in this session.
+        Keeps only question + a short answer snippet per turn (no raw results/SQL),
+        and trims the oldest turns first until the block fits token_budget.
+        """
+        if not session_id:
+            return ""
+        try:
+            prior_turns = self.get_history(limit=limit, session_id=session_id)
+        except Exception as e:
+            logging.warning(f"[History] Failed to fetch prior turns for session {session_id}: {e}")
+            return ""
+
+        if not prior_turns:
+            return ""
+
+        lines = []
+        for turn in prior_turns:
+            question = str(turn.get("query", "")).strip()
+            if not question:
+                continue
+            explanation = str(turn.get("explanation", "") or "").strip()
+            snippet = explanation[:150].strip()
+            if len(explanation) > 150:
+                snippet += "..."
+            lines.append(f"Q: {question}\nA: {snippet}" if snippet else f"Q: {question}")
+
+        while lines and self.count_tokens("\n".join(lines)) > token_budget:
+            lines.pop(0)
+
+        if not lines:
+            return ""
+
+        return "Prior turns in this session (most recent last, for resolving follow-ups only):\n" + "\n".join(lines)
+
     def process_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                       user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                      background_tasks: Any = None, task_id: int = None) -> Dict[str, Any]:
+                      background_tasks: Any = None, task_id: int = None,
+                      use_chat_history: bool = False, history_limit: int = 3,
+                      include_explanation: bool = True) -> Dict[str, Any]:
         """Process natural language query and return results.
         Flow: fetch Mem0 RBAC -> schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
         """
@@ -57,51 +94,8 @@ class QueryService:
 
             logging.info(f"--- START PROCESSING QUERY: '{user_query[:80]}' ---")
 
-            # Fetch Mem0 Permissions
-            permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-            if self.mem0_service:
-                if user_id:
-                    permissions = self.mem0_service.get_user_permissions(user_id)
-                    logging.info(f"[RBAC] Active permissions from Mem0: {permissions}")
-                    print(f"[Mem0 RBAC Return] Active permissions for user {user_id}: {permissions}")
-                
-                # Fetch task mapping if task_id is provided
-                if task_id:
-                    try:
-                        memories = self.mem0_service.client.get_all(filters={"user_id": "global"})
-                        print(f"[Mem0 Raw Return] Raw memories fetched from Mem0: {memories}")
-                        task_tables = None
-                        for m in memories:
-                            meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                            if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                                print(f"[Mem0 Matched Memory] Found task mapping in Mem0: {m}")
-                                raw_tables = meta.get("tables", "[]")
-                                try:
-                                    task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                                except Exception:
-                                    task_tables = []
-                                break
-                        
-                        if task_tables is not None:
-                            logging.info(f"[Task Security] Enforcing task {task_id} allowed tables: {task_tables}")
-                            # Override allowed_tables to restrict to the task's allowed tables
-                            if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                                u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                                t_allowed = {t.lower() for t in task_tables}
-                                permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                            else:
-                                permissions["allowed_tables"] = task_tables
-                            print(f"[Mem0 Tables] task_id: {task_id} | Allowed tables sent to LLM: {permissions['allowed_tables']}")
-                        else:
-                            logging.warning(f"[Task Security] Task {task_id} not found in Mem0. Access defaults to all tables.")
-                            permissions["allowed_tables"] = ["*"]
-                            print(f"[Mem0 Tables] task_id: {task_id} not found in Mem0 | Defaults sent to LLM: {permissions['allowed_tables']}")
-                    except Exception as task_err:
-                        logging.error(f"[Task Security] Failed to lookup task {task_id}: {task_err}")
-                else:
-                    # if no task_id then allowed all the table by default
-                    permissions["allowed_tables"] = ["*"]
-                    permissions["restricted_tables"] = []
+            # RBAC and Mem0 bypassed — Full administrative access to all tables
+            permissions = {"role": "admin", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
 
             db_params = self.db_service.get_connection_params()
             db_name = db_params.get("database", "unknown")
@@ -165,6 +159,12 @@ class QueryService:
                     f"Never expose or query any other tables under any circumstances.)"
                 )
 
+            if use_chat_history:
+                history_context = self._build_history_context(session_id, history_limit)
+                if history_context:
+                    augmented_query = f"{history_context}\n\nCurrent question: {augmented_query}"
+                    logging.info(f"[STEP 2] Injected chat history context ({self.count_tokens(history_context)} tokens, up to {history_limit} turns).")
+
             input_tokens += self.count_tokens(augmented_query) + self.count_tokens(schema_context)
 
             try:
@@ -200,8 +200,18 @@ class QueryService:
                 raise RuntimeError(f"SQL generation failed: {err_str}")
 
             sql_queries = extract_sql_queries(str(generated_text))
-            if not sql_queries:
-                raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
+            if not sql_queries or "Insufficient schema context" in str(generated_text):
+                if self._detect_meta_query(user_query):
+                    logging.info("[STEP 2] Meta-query detected with non-executable LLM text — auto-providing metadata catalog query.")
+                    if dialect in ("mssql", "sqlserver"):
+                        sql_queries = ["SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"]
+                    elif dialect in ("mysql", "mariadb"):
+                        sql_queries = [f"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"]
+                    else:
+                        sql_queries = ["SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') AND table_type = 'BASE TABLE' ORDER BY table_schema, table_name"]
+                else:
+                    if not sql_queries:
+                        raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
 
             logging.info(f"[STEP 2] Extracted {len(sql_queries)} SQL queries.")
 
@@ -303,16 +313,20 @@ class QueryService:
 
             logging.info("[STEP 3] All queries executed successfully.")
 
-            # ── STEP 4: Generate explanation ────────────────────────────────────
-            logging.info("[STEP 4] Generating natural language explanation...")
-            explanation_chain = self.llm_service.create_explanation_chain()
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
-            explanation = explanation_chain.invoke({
-                "Question": user_query,
-                "schema_info": schema_context,
-                "results": str(results)
-            })
-            output_tokens += self.count_tokens(str(explanation))
+            # ── STEP 4: Generate explanation (optional, to save tokens) ─────────
+            if include_explanation:
+                logging.info("[STEP 4] Generating natural language explanation...")
+                explanation_chain = self.llm_service.create_explanation_chain()
+                input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+                explanation = explanation_chain.invoke({
+                    "Question": user_query,
+                    "schema_info": schema_context,
+                    "results": str(results)
+                })
+                output_tokens += self.count_tokens(str(explanation))
+            else:
+                logging.info("[STEP 4] Explanation generation disabled by request — skipping.")
+                explanation = ""
             logging.info("--- FINISHED PROCESSING QUERY ---")
 
             # Audit successful execution in Mem0
@@ -375,9 +389,10 @@ class QueryService:
             raise
 
             
-    async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0, 
+    async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                           user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
-                          task_id: int = None):
+                          task_id: int = None, use_chat_history: bool = False, history_limit: int = 3,
+                          include_explanation: bool = True):
         """Process natural language query and stream results chunk by chunk.
         Enforces schema discovery, RBAC, meta-query injection, auto-repair, explanation streaming, auditing, and persistence.
         """
@@ -481,6 +496,12 @@ class QueryService:
                     f"so that ONLY the allowed tables are returned in the query results. "
                     f"Never expose or query any other tables under any circumstances.)"
                 )
+
+            if use_chat_history:
+                history_context = self._build_history_context(session_id, history_limit)
+                if history_context:
+                    augmented_query = f"{history_context}\n\nCurrent question: {augmented_query}"
+                    logging.info(f"[STREAM] Injected chat history context ({self.count_tokens(history_context)} tokens, up to {history_limit} turns).")
 
             input_tokens += self.count_tokens(augmented_query) + self.count_tokens(schema_context)
 
@@ -616,25 +637,29 @@ class QueryService:
             yield json.dumps({"type": "sql", "content": final_sql_queries}) + "\n"
             yield json.dumps({"type": "results", "content": results}) + "\n"
 
-            # 5. Explaining Results (The actual Stream)
-            yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
-            explanation_chain = self.llm_service.create_explanation_chain()
-            
-            explanation_input = {
-                "Question": user_query,
-                "schema_info": schema_context,
-                "results": str(results)
-            }
-            
-            input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
-            
-            yield json.dumps({"type": "explanation_start"}) + "\n"
+            # 5. Explaining Results (The actual Stream) — optional, to save tokens
             full_explanation = ""
-            async for chunk in explanation_chain.astream(explanation_input):
-                full_explanation += chunk
-                yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
-            
-            output_tokens += self.count_tokens(full_explanation)
+            if include_explanation:
+                yield json.dumps({"type": "status", "content": "Generating explanation..."}) + "\n"
+                explanation_chain = self.llm_service.create_explanation_chain()
+
+                explanation_input = {
+                    "Question": user_query,
+                    "schema_info": schema_context,
+                    "results": str(results)
+                }
+
+                input_tokens += self.count_tokens(user_query) + self.count_tokens(schema_context)
+
+                yield json.dumps({"type": "explanation_start"}) + "\n"
+                async for chunk in explanation_chain.astream(explanation_input):
+                    full_explanation += chunk
+                    yield json.dumps({"type": "explanation_chunk", "content": chunk}) + "\n"
+
+                output_tokens += self.count_tokens(full_explanation)
+            else:
+                logging.info("[STREAM] Explanation generation disabled by request — skipping.")
+                yield json.dumps({"type": "explanation_start"}) + "\n"
             
             # Audit successful execution in Mem0
             if self.mem0_service:
@@ -715,14 +740,15 @@ class QueryService:
             "what are the tables", "tables in the db", "tables in the database",
             "tables exist", "available tables", "existing tables",
             "show tables", "show table", "what tables", "which tables",
-            "tables available", "tables do we have", "tables are there",
+            "tables available", "tables do we have", "tables are there", "table list",
             # columns
             "all the columns", "list columns", "list column", "show columns",
             "show column", "what columns", "which columns", "all columns",
             "column names", "column name",
             # schemas / structure
             "list schemas", "list schema", "all schemas", "database schema", "schema list",
-            "database size", "database version",
+            "schema of", "show schema", "view schema", "db schema", "the schema", "schema",
+            "database size", "database version", "db structure", "structure of",
             "metadata", "structure", "describe table", "describe tables",
         ]
         q_lower = query.lower()

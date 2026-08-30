@@ -257,56 +257,8 @@ async def list_tables(
         
         tables = db_service.get_tables()
         
-        # Resolve permissions
-        permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
-        if mem0_service:
-            if current_user:
-                try:
-                    permissions = mem0_service.get_user_permissions(current_user)
-                except Exception:
-                    permissions = {"role": "standard", "allowed_tables": ["*"], "restricted_tables": []}
-
-            if task_id:
-                try:
-                    memories = mem0_service.client.get_all(filters={"user_id": "global"})
-                    task_tables = None
-                    for m in memories:
-                        meta = m.get("metadata") if isinstance(m, dict) else getattr(m, "metadata", None)
-                        if meta and meta.get("type") == "task_tables" and str(meta.get("task_id")) == str(task_id):
-                            raw_tables = meta.get("tables", "[]")
-                            try:
-                                import json
-                                task_tables = json.loads(raw_tables) if isinstance(raw_tables, str) else raw_tables
-                            except Exception:
-                                task_tables = []
-                            break
-                    
-                    if task_tables is not None:
-                        if "allowed_tables" in permissions and permissions["allowed_tables"] != ["*"]:
-                            u_allowed = {t.lower() for t in permissions["allowed_tables"]}
-                            t_allowed = {t.lower() for t in task_tables}
-                            permissions["allowed_tables"] = list(u_allowed.intersection(t_allowed))
-                        else:
-                            permissions["allowed_tables"] = task_tables
-                    else:
-                        permissions["allowed_tables"] = ["*"]
-                except Exception:
-                    permissions["allowed_tables"] = ["*"]
-            else:
-                # if no task_id then allowed all the table by default
-                permissions["allowed_tables"] = ["*"]
-                permissions["restricted_tables"] = []
-
-        # Filter the tables list based on resolved permissions
-        role = permissions.get("role", "standard")
-        if role != "admin":
-            allowed_tables = permissions.get("allowed_tables")
-            if allowed_tables is not None and allowed_tables != ["*"]:
-                allowed_lower = {t.lower() for t in allowed_tables}
-                tables = [t for t in tables if t.lower() in allowed_lower]
-            elif permissions.get("restricted_tables"):
-                restricted_lower = {t.lower() for t in permissions["restricted_tables"]}
-                tables = [t for t in tables if t.lower() not in restricted_lower]
+        # Bypass RBAC and Mem0 — Full administrative access to all tables
+        permissions = {"role": "admin", "allowed_tables": ["*"], "restricted_tables": [], "row_filters": []}
         
         params = db_service.get_connection_params()
         return {

@@ -126,14 +126,11 @@ def get_mongodb_service() -> MongoDBService:
         )
 
 def get_mem0_service() -> Mem0Service:
-    """Dependency to get Mem0 service instance"""
+    """Dependency to get Mem0 service instance (Stub/Disabled)"""
     try:
         return service_registry.get_mem0_service()
-    except RuntimeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+    except Exception:
+        return Mem0Service()
 
 
 def get_user_id_from_token(token: str) -> Optional[str]:

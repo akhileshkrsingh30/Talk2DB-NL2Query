@@ -17,6 +17,8 @@ class LLMService:
         """Test if the API key is valid by making a simple request"""
         try:
             self.last_error = None
+            if base_url and base_url.startswith("https://") and (":11434" in base_url or ":11435" in base_url):
+                base_url = "http://" + base_url[8:]
             # Test with a simple request to validate the API key
             base_headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -68,6 +70,11 @@ class LLMService:
             api_key = api_key.strip()
             base_url = (base_url or settings.openai_api_base).strip()
             
+            # Ollama servers do not use HTTPS by default. Auto-convert https:// to http:// for Ollama ports
+            if base_url.startswith("https://") and (":11434" in base_url or ":11435" in base_url):
+                print(f"   [Notice] Converting Ollama base_url scheme from https:// to http://")
+                base_url = "http://" + base_url[8:]
+                
             # Default to OpenAI official API if base_url is empty
             if not base_url:
                 base_url = "https://api.openai.com/v1"
@@ -253,7 +260,7 @@ STEP 4 — WRITE THE SQL
 Apply these quality rules:
 - Always alias tables (e.g., orders o, customers c)
 - Use COALESCE to handle NULLs in aggregations
-- Add meaningful column aliases in SELECT (e.g., AS total_revenue)
+- ALWAYS provide explicit column aliases for ALL aggregates, calculations, and functions in SELECT (e.g., SELECT COUNT(*) AS total_count, SELECT MAX(created_at) AS latest_date). NEVER omit column aliases.
 - Apply LIMIT 100 unless the question asks for all rows or a count
 - Use proper {dialect.upper()} syntax for date functions, string ops, and casting
 - For MSSQL use TOP instead of LIMIT; for Oracle use FETCH FIRST N ROWS ONLY
@@ -265,10 +272,11 @@ STEP 5 — VERIFY
 - No hallucinated table or column names.
 
 ## ABSOLUTE CONSTRAINTS
-1. Use ONLY tables and columns from the schema above. Zero exceptions.
-2. If the question cannot be answered from the given schema, return exactly:
+1. Use ONLY tables and columns from the schema above, OR standard system catalog views (e.g., INFORMATION_SCHEMA.TABLES, INFORMATION_SCHEMA.COLUMNS, sys.tables) when answering metadata, schema, or structural questions about the database.
+2. If the question cannot be answered from the given schema or system metadata views, return exactly:
    SELECT 'Insufficient schema context to answer this question' AS message;
 3. Return ONLY the final raw SQL statement. No markdown, no ```, no explanation text.
+4. Return exactly ONE SQL query statement. Do NOT output multiple queries or duplicate queries.
 
 SQL Query:"""
         )
