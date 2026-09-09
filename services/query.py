@@ -78,11 +78,28 @@ class QueryService:
 
         return "Prior turns in this session (most recent last, for resolving follow-ups only):\n" + "\n".join(lines)
 
+    def _sanitize_dialect_sql(self, sql: str, dialect: str) -> str:
+        """Sanitize SQL query for dialect-specific syntax quirks (e.g. converting LIMIT to TOP for MSSQL)."""
+        if not sql:
+            return sql
+        
+        dialect_clean = dialect.lower() if dialect else ""
+        if dialect_clean in ["mssql", "sqlserver", "tsql"]:
+            # If query contains LIMIT N at end, convert to SELECT TOP N
+            limit_match = re.search(r"\bLIMIT\s+(\d+)\b", sql, re.IGNORECASE)
+            if limit_match:
+                limit_val = limit_match.group(1)
+                sql_no_limit = re.sub(r"\bLIMIT\s+\d+\b;?", "", sql, flags=re.IGNORECASE).strip()
+                if re.match(r"^\s*SELECT\b", sql_no_limit, re.IGNORECASE) and not re.match(r"^\s*SELECT\s+TOP\b", sql_no_limit, re.IGNORECASE):
+                    sql_no_limit = re.sub(r"^\s*SELECT\b", f"SELECT TOP {limit_val}", sql_no_limit, count=1, flags=re.IGNORECASE)
+                sql = sql_no_limit
+        return sql
+
     def process_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                       user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
                       background_tasks: Any = None, task_id: int = None,
                       use_chat_history: bool = False, history_limit: int = 3,
-                      include_explanation: bool = True) -> Dict[str, Any]:
+                      include_explanation: bool = True, top_k: Optional[int] = 50) -> Dict[str, Any]:
         """Process natural language query and return results.
         Flow: schema fetch & filter → SQL generation → auto-repair on error → execution → explanation
         """
@@ -108,7 +125,7 @@ class QueryService:
             schema_context = ""
             try:
                 allowed_tables = permissions.get("allowed_tables")
-                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables, user_query=user_query, top_k=top_k)
                 if schema_context:
                     if allowed_tables is not None and allowed_tables != ["*"]:
                         logging.info(f"[STEP 1] Schema fetched ({len(schema_context)} chars) filtered by task allowed tables: {allowed_tables}")
@@ -122,10 +139,11 @@ class QueryService:
             if task_id:
                 schema_context = f"these are the table task_id {task_id} is allowed\nthese are the table task_id{task_id} is allowed\n\n" + schema_context
 
-            # Truncate if oversized
-            if len(schema_context) > settings.llm_max_context_chars:
-                logging.info(f"[STEP 1] Truncating schema from {len(schema_context)} → {settings.llm_max_context_chars} chars.")
-                schema_context = schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated...]"
+            # Truncate if oversized (cap at 20,000 chars max to prevent LLM prompt prefill freezing)
+            max_schema_len = min(settings.llm_max_context_chars, 20000)
+            if len(schema_context) > max_schema_len:
+                logging.info(f"[STEP 1] Truncating schema from {len(schema_context)} → {max_schema_len} chars.")
+                schema_context = schema_context[:max_schema_len] + "\n[...schema truncated...]"
 
             logging.info(f"[STEP 1] Schema sent to LLM:\n{schema_context}\n{'─'*60}")
 
@@ -198,21 +216,13 @@ class QueryService:
                     raise RuntimeError(f"Model '{configured_model}' not found on '{llm_base}'. Please re-configure.")
                 raise RuntimeError(f"SQL generation failed: {err_str}")
 
-            sql_queries = extract_sql_queries(str(generated_text))
-            if not sql_queries or "Insufficient schema context" in str(generated_text):
-                if self._detect_meta_query(user_query):
-                    logging.info("[STEP 2] Meta-query detected with non-executable LLM text — auto-providing metadata catalog query.")
-                    if dialect in ("mssql", "sqlserver"):
-                        sql_queries = ["SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME"]
-                    elif dialect in ("mysql", "mariadb"):
-                        sql_queries = [f"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"]
-                    else:
-                        sql_queries = ["SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') AND table_type = 'BASE TABLE' ORDER BY table_schema, table_name"]
-                else:
-                    if not sql_queries:
-                        raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
+            sql_queries = [self._sanitize_dialect_sql(q, dialect) for q in extract_sql_queries(str(generated_text))]
+            if not sql_queries:
+                raise ValueError(f"No valid SQL query could be generated from the LLM response for '{db_name}'.")
 
             logging.info(f"[STEP 2] Extracted {len(sql_queries)} SQL queries.")
+            for i, sql in enumerate(sql_queries, 1):
+                logging.info(f"[LLM GENERATED SQL {i}/{len(sql_queries)}]:\n{sql}")
 
             # Post-Generation Guardrail: block SQL referencing tables outside allowed list
             allowed_tables = permissions.get("allowed_tables", ["*"])
@@ -262,7 +272,7 @@ class QueryService:
                         output_tokens += self.count_tokens(str(repaired_sql))
                         repaired_queries = extract_sql_queries(str(repaired_sql))
                         if repaired_queries:
-                            repaired_query = repaired_queries[0]
+                            repaired_query = self._sanitize_dialect_sql(repaired_queries[0], dialect)
                             logging.info(f"[STEP 3] Repaired SQL:\n{repaired_query}")
                             
                             # Post-Generation Guardrail Check on Repaired SQL output
@@ -381,7 +391,7 @@ class QueryService:
     async def stream_query(self, user_query: str, max_tokens: int = 4096, temperature: float = 0.0,
                           user_id: str = None, session_id: str = None, message_id: str = None, company_id: str = None,
                           task_id: int = None, use_chat_history: bool = False, history_limit: int = 3,
-                          include_explanation: bool = True):
+                          include_explanation: bool = True, top_k: Optional[int] = 50):
         """Process natural language query and stream results chunk by chunk.
         Enforces schema discovery, RBAC, meta-query injection, auto-repair, explanation streaming, auditing, and persistence.
         """
@@ -403,18 +413,19 @@ class QueryService:
 
             # Fetch simplified schema
             allowed_tables = permissions.get("allowed_tables")
-            schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+            schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables, user_query=user_query, top_k=top_k)
             if not schema_context:
                 yield json.dumps({"type": "status", "content": "Falling back to database schema..."}) + "\n"
-                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables)
+                schema_context = self.db_service.get_simplified_schema(allowed_tables=allowed_tables, user_query=user_query, top_k=top_k)
 
             if task_id:
                 schema_context = f"these are the table task_id {task_id} is allowed\nthese are the table task_id{task_id} is allowed\n\n" + schema_context
 
-            # Truncate if oversized
-            if len(schema_context) > settings.llm_max_context_chars:
-                logging.info(f"[STEP 1] Truncating schema from {len(schema_context)} → {settings.llm_max_context_chars} chars.")
-                schema_context = schema_context[:settings.llm_max_context_chars] + "\n[...schema truncated...]"
+            # Truncate if oversized (cap at 20,000 chars max to prevent LLM prompt prefill freezing)
+            max_schema_len = min(settings.llm_max_context_chars, 20000)
+            if len(schema_context) > max_schema_len:
+                logging.info(f"[STEP 1] Truncating schema from {len(schema_context)} → {max_schema_len} chars.")
+                schema_context = schema_context[:max_schema_len] + "\n[...schema truncated...]"
 
             # Meta-query injection
             if self._detect_meta_query(user_query):
@@ -480,9 +491,13 @@ class QueryService:
                     raise RuntimeError(f"Model '{configured_model}' not found on '{llm_base}'. Please re-configure.")
                 raise RuntimeError(f"SQL generation failed: {err_str}")
 
-            sql_queries = extract_sql_queries(str(generated_text))
+            sql_queries = [self._sanitize_dialect_sql(q, dialect) for q in extract_sql_queries(str(generated_text))]
             if not sql_queries:
-                raise ValueError(f"No SQL queries extracted from LLM response for '{db_name}'.")
+                raise ValueError(f"No valid SQL query could be generated from the LLM response for '{db_name}'.")
+
+            logging.info(f"[STREAM] Extracted {len(sql_queries)} SQL queries.")
+            for i, sql in enumerate(sql_queries, 1):
+                logging.info(f"[LLM GENERATED SQL {i}/{len(sql_queries)}]:\n{sql}")
 
             # Post-Generation Guardrail Check on Generated SQL
             allowed_tables = permissions.get("allowed_tables", ["*"])
@@ -532,7 +547,7 @@ class QueryService:
                         output_tokens += self.count_tokens(str(repaired_sql))
                         repaired_queries = extract_sql_queries(str(repaired_sql))
                         if repaired_queries:
-                            repaired_query = repaired_queries[0]
+                            repaired_query = self._sanitize_dialect_sql(repaired_queries[0], dialect)
                             logging.info(f"[STREAM] Repaired SQL:\n{repaired_query}")
                             
                             # Post-Generation Guardrail Check on Repaired SQL
@@ -677,6 +692,9 @@ class QueryService:
             "tables exist", "available tables", "existing tables",
             "show tables", "show table", "what tables", "which tables",
             "tables available", "tables do we have", "tables are there", "table list",
+            # rows / counts
+            "number of rows", "rows each table", "how many rows", "row count",
+            "rows per table", "rows in each table", "count of rows", "table rows", "row counts",
             # columns
             "all the columns", "list columns", "list column", "show columns",
             "show column", "what columns", "which columns", "all columns",
@@ -689,6 +707,8 @@ class QueryService:
         ]
         q_lower = query.lower()
         return any(kw in q_lower for kw in meta_keywords)
+
+
 
     def _get_meta_context(self, db_name: str, dialect: str = "postgresql") -> str:
         """Provide dialect-aware context for metadata queries (information_schema)."""

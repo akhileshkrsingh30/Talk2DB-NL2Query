@@ -53,7 +53,8 @@ async def process_natural_language_query(
             task_id=query_request.task_id,
             use_chat_history=query_request.use_chat_history,
             history_limit=query_request.history_limit,
-            include_explanation=query_request.include_explanation
+            include_explanation=query_request.include_explanation,
+            top_k=query_request.top_k
         )
         return result
         
@@ -108,7 +109,8 @@ async def stream_natural_language_query(
             task_id=query_request.task_id,
             use_chat_history=query_request.use_chat_history,
             history_limit=query_request.history_limit,
-            include_explanation=query_request.include_explanation
+            include_explanation=query_request.include_explanation,
+            top_k=query_request.top_k
         ),
         headers=headers
     )

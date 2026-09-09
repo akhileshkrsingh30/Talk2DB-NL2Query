@@ -11,7 +11,7 @@ import { useQuerySettings } from "../hooks/useQuerySettings";
  * and read by lib/querySettings.ts::applyQuerySettings() when building query requests.
  */
 export function QueryHistorySettings({ sessionId }: { sessionId: string }) {
-  const { settings, setUseChatHistory, setHistoryLimit, setIncludeExplanation } =
+  const { settings, setUseChatHistory, setHistoryLimit, setIncludeExplanation, setTopK } =
     useQuerySettings(sessionId);
 
   return (
@@ -64,6 +64,34 @@ export function QueryHistorySettings({ sessionId }: { sessionId: string }) {
             explanation step, reducing tokens per query.
           </small>
         </span>
+      </label>
+
+      <label className="settings-row" style={{ marginTop: "1rem" }}>
+        <span>
+          Schema Top-K Tables (1 – 200)
+          <small>
+            Limit maximum relevant database tables retrieved and passed into prompt context.
+            Lower values (e.g. 5–20) increase speed; higher values (up to 200) cover broader schemas.
+          </small>
+        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <input
+            type="range"
+            min={1}
+            max={200}
+            step={1}
+            value={settings.topK}
+            onChange={(e) => setTopK(Math.max(1, Math.min(200, Number(e.target.value) || 1)))}
+          />
+          <input
+            type="number"
+            min={1}
+            max={200}
+            value={settings.topK}
+            onChange={(e) => setTopK(Math.max(1, Math.min(200, Number(e.target.value) || 1)))}
+            style={{ width: "60px", padding: "4px 8px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+        </div>
       </label>
     </section>
   );

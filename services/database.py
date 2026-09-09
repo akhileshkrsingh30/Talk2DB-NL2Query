@@ -2,6 +2,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Optional, Dict, Any, List, Union
 import urllib.parse
+import re
 from langchain_community.utilities.sql_database import SQLDatabase
 import json
 from datetime import datetime, date, time
@@ -454,8 +455,8 @@ class DatabaseService:
                         
         except Exception as e:
             err_msg = str(e)
-            if "columns with no names" in err_msg and self.db_type == "mssql":
-                logging.info("   [Fallback] Handling un-aliased MSSQL columns via tuple cursor...")
+            if self.db_type == "mssql":
+                logging.info(f"   [Fallback] Handling MSSQL execution exception ({err_msg[:120]}) via raw tuple cursor...")
                 try:
                     with pymssql.connect(
                         server=self.connection_params["host"],
@@ -467,21 +468,32 @@ class DatabaseService:
                     ) as raw_conn:
                         with raw_conn.cursor() as raw_cursor:
                             raw_cursor.execute(sql_query)
-                            description = raw_cursor.description
-                            col_names = [col[0] if (col and col[0]) else f"col_{i+1}" for i, col in enumerate(description)] if description else []
-                            rows = raw_cursor.fetchall()
-                            dict_results = [dict(zip(col_names, row)) for row in rows]
-                            elapsed = time.time() - start_time
-                            logging.info(f"   [OK Fallback] DB Response: {len(dict_results)} rows in {elapsed:.3f}s")
-                            return dict_results
+                            is_select = sql_query.strip().lower().startswith(("select", "with", "show", "describe", "explain"))
+                            if is_select:
+                                description = raw_cursor.description
+                                col_names = [col[0] if (col and col[0]) else f"col_{i+1}" for i, col in enumerate(description)] if description else []
+                                rows = raw_cursor.fetchall()
+                                dict_results = [dict(zip(col_names, [convert_to_serializable(item) for item in row])) for row in rows]
+                                elapsed = time.time() - start_time
+                                logging.info(f"   [OK Fallback] DB Response: {len(dict_results)} rows in {elapsed:.3f}s")
+                                return dict_results
+                            else:
+                                raw_conn.commit()
+                                elapsed = time.time() - start_time
+                                return {
+                                    "status": "Command executed successfully",
+                                    "rows_affected": raw_cursor.rowcount,
+                                    "query": sql_query.strip()
+                                }
                 except Exception as fallback_err:
                     raise RuntimeError(f"Query execution failed: {str(fallback_err)}")
             raise RuntimeError(f"Query execution failed: {str(e)}")
 
-    def get_simplified_schema(self, allowed_tables: Optional[List[str]] = None) -> str:
+    def get_simplified_schema(self, allowed_tables: Optional[List[str]] = None, user_query: Optional[str] = None, top_k: Optional[int] = 50) -> str:
         if not self.connected:
             raise RuntimeError("Database not connected")
-        use_cache = allowed_tables is None or allowed_tables == ["*"]
+        effective_top_k = max(1, min(200, int(top_k if top_k is not None else 50)))
+        use_cache = (allowed_tables is None or allowed_tables == ["*"]) and not user_query
         key = make_db_cache_key(self.connection_params or {})
         if use_cache:
             try:
@@ -599,23 +611,41 @@ class DatabaseService:
                 tables.setdefault(k, []).append(r)
             except Exception:
                 continue
-        MAX_TABLES = 200
-        MAX_COLS = 150
-        lines: List[str] = []
-        count_tables = 0
-        
         # Prepare allowed tables set if filtering is enabled
         allowed_lower = None
         if allowed_tables is not None and allowed_tables != ["*"]:
             allowed_lower = {t.lower() for t in allowed_tables}
-            
+
+        candidate_tables: Dict[tuple, List[Dict[str, Any]]] = {}
         for (schema, table), columns in tables.items():
-            # If allowed_tables filter is active, skip any tables not in the list
             if allowed_lower is not None and table.lower() not in allowed_lower:
                 continue
-                
-            if count_tables >= MAX_TABLES:
-                break
+            candidate_tables[(schema, table)] = columns
+
+        if user_query and len(candidate_tables) > effective_top_k:
+            query_words = set(re.findall(r"\w+", user_query.lower()))
+            scored_tables = []
+            for (schema, table), columns in candidate_tables.items():
+                score = 0
+                t_name_lower = table.lower()
+                for word in query_words:
+                    if len(word) > 2:
+                        if word in t_name_lower:
+                            score += 10
+                        for col in columns:
+                            col_name = str(col.get("column_name", "")).lower()
+                            if word in col_name:
+                                score += 3
+                scored_tables.append(((schema, table), columns, score))
+
+            scored_tables.sort(key=lambda x: x[2], reverse=True)
+            selected_tables = {(s, t): cols for (s, t), cols, score in scored_tables[:effective_top_k]}
+        else:
+            selected_tables = dict(list(candidate_tables.items())[:effective_top_k])
+
+        MAX_COLS = 150
+        lines: List[str] = []
+        for (schema, table), columns in selected_tables.items():
             parts: List[str] = []
             for col in columns[:MAX_COLS]:
                 name = col.get("column_name")
@@ -627,7 +657,6 @@ class DatabaseService:
                     suffix += " NOT NULL"
                 parts.append(f"{name} {dtype}{suffix}")
             lines.append(f"{schema}.{table}: " + ", ".join(parts))
-            count_tables += 1
         text = "\n".join(lines)
         max_context = getattr(settings, "llm_max_context_chars", 200000)
         if len(text) > max_context:

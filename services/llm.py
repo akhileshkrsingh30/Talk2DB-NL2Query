@@ -126,7 +126,8 @@ class LLMService:
                 temperature=1.0 if "nemotron" in model.lower() else 0.0,
                 max_tokens=16384 if "nemotron" in model.lower() else settings.llm_max_output_tokens,
                 top_p=0.95 if "nemotron" in model.lower() else 1.0,
-                timeout=120,
+                timeout=30,
+                max_retries=1,
                 default_headers=headers,
                 model_kwargs=model_kwargs
             )
@@ -225,8 +226,18 @@ class LLMService:
         if not self.is_configured():
             raise RuntimeError("LLM not configured.")
 
+        dialect_clean = dialect.lower()
+        if dialect_clean in ["mssql", "sqlserver", "tsql"]:
+            dialect_header = "T-SQL (Microsoft SQL Server)"
+            limit_instruction = "CRITICAL: You are generating T-SQL for Microsoft SQL Server. DO NOT USE 'LIMIT'. Use 'SELECT TOP 100' or 'OFFSET N ROWS FETCH NEXT M ROWS ONLY'."
+            date_instruction = "Use T-SQL date functions like GETDATE(), DATEADD(), DATEDIFF(), DATEPART()."
+        else:
+            dialect_header = dialect.upper()
+            limit_instruction = "Apply LIMIT 100 unless the question asks for all rows or a count."
+            date_instruction = f"Use proper {dialect.upper()} syntax for date functions, string ops, and casting."
+
         prompt = ChatPromptTemplate.from_template(
-            f"""You are an expert {dialect.upper()} SQL engineer with deep knowledge of query optimization, JOIN strategies, and window functions.
+            f"""You are an expert {dialect_header} SQL engineer with deep knowledge of query optimization, JOIN strategies, and window functions.
 
 ## DATABASE SCHEMA
 The ONLY tables and columns you are allowed to use:
@@ -254,16 +265,14 @@ STEP 3 — PLAN THE QUERY STRUCTURE
 - Multiple related tables → JOIN with explicit ON conditions
 - 3+ tables or self-referencing → use CTEs (WITH clauses) for readability
 - Rankings, running totals, percentages → use window functions (ROW_NUMBER, RANK, SUM OVER, etc.)
-- Time-series trends → GROUP BY date truncation (DATE_TRUNC for PostgreSQL)
 
 STEP 4 — WRITE THE SQL
 Apply these quality rules:
 - Always alias tables (e.g., orders o, customers c)
-- Use COALESCE to handle NULLs in aggregations
-- ALWAYS provide explicit column aliases for ALL aggregates, calculations, and functions in SELECT (e.g., SELECT COUNT(*) AS total_count, SELECT MAX(created_at) AS latest_date). NEVER omit column aliases.
-- Apply LIMIT 100 unless the question asks for all rows or a count
-- Use proper {dialect.upper()} syntax for date functions, string ops, and casting
-- For MSSQL use TOP instead of LIMIT; for Oracle use FETCH FIRST N ROWS ONLY
+- Use COALESCE or ISNULL to handle NULLs in aggregations
+- ALWAYS provide explicit column aliases for ALL aggregates, calculations, and functions in SELECT (e.g., SELECT COUNT(*) AS total_count). NEVER omit column aliases.
+- {limit_instruction}
+- {date_instruction}
 
 STEP 5 — VERIFY
 - Every table referenced exists in the schema.
@@ -287,8 +296,18 @@ SQL Query:"""
         if not self.is_configured():
             raise RuntimeError("LLM not configured.")
 
+        dialect_clean = dialect.lower() if dialect else ""
+        if dialect_clean in ["mssql", "sqlserver", "tsql"]:
+            dialect_header = "T-SQL (Microsoft SQL Server)"
+            repair_dialect_rules = """- For MSSQL, NEVER use 'LIMIT'. Use 'SELECT TOP N' or 'OFFSET N ROWS FETCH NEXT M ROWS ONLY'.
+- Use table names EXACTLY as formatted in schema (e.g. dbo.tablename or tablename). DO NOT prefix table names with database/catalog name.
+- Use LIKE instead of ILIKE."""
+        else:
+            dialect_header = dialect.upper()
+            repair_dialect_rules = f"- Syntax error → fix to valid {dialect.upper()} syntax"
+
         prompt = ChatPromptTemplate.from_template(
-            f"""You are an expert {dialect.upper()} SQL debugger.
+            f"""You are an expert {dialect_header} SQL debugger.
 
 ## DATABASE SCHEMA
 {{schema_context}}
@@ -307,7 +326,7 @@ Fix the SQL so it runs correctly. Common issues to check:
 - Column name typo → replace with exact name from schema
 - Ambiguous column → qualify with table alias
 - Wrong JOIN key → use the correct foreign key from schema
-- Syntax error → fix to valid {dialect.upper()} syntax
+- {repair_dialect_rules}
 - Missing GROUP BY → add all non-aggregated SELECT columns
 - Type mismatch in JOIN or WHERE → cast appropriately
 

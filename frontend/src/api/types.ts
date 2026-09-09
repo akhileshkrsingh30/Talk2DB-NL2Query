@@ -43,4 +43,6 @@ export interface QueryRequest {
   history_limit?: number;
   /** If false, backend skips natural-language explanation generation to save tokens. */
   include_explanation?: boolean;
+  /** Maximum number of top relevant tables to retrieve for prompt context (1-200). */
+  top_k?: number;
 }

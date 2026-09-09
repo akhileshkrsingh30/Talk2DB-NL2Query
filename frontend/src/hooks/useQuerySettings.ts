@@ -36,5 +36,6 @@ export function useQuerySettings(sessionId: string) {
     setUseChatHistory: (value: boolean) => update({ useChatHistory: value }),
     setHistoryLimit: (value: number) => update({ historyLimit: value }),
     setIncludeExplanation: (value: boolean) => update({ includeExplanation: value }),
+    setTopK: (value: number) => update({ topK: value }),
   };
 }

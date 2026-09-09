@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     mongo_uri: str = Field("mongodb://localhost:27017/", env="MONGO_URI")
     mongo_db_name: str = Field("ValoDSS", env="MONGO_DB_NAME")
     
+    # Qdrant Vector DB configuration for Schema RAG (Step 1 Docker)
+    qdrant_host: str = Field("localhost", env="QDRANT_HOST")
+    qdrant_port: int = Field(6333, env="QDRANT_PORT")
+    qdrant_url: str = Field("http://localhost:6333", env="QDRANT_URL")
+    qdrant_collection: str = Field("schema_tables", env="QDRANT_COLLECTION_NAME")
 
     # Application settings
     app_title: str = "Database Query API"

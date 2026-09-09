@@ -33,6 +33,7 @@ class QueryRequest(BaseModel):
     use_chat_history: Optional[bool] = Field(False, description="If true, include condensed context from prior turns of this session (session_id) when generating SQL")
     history_limit: Optional[int] = Field(3, ge=1, le=10, description="Number of prior turns to consider when use_chat_history is enabled")
     include_explanation: Optional[bool] = Field(True, description="If false, skip natural language explanation generation to reduce token usage")
+    top_k: Optional[int] = Field(50, ge=1, le=200, description="Top-K maximum tables to retrieve and include in schema context (1-200)")
 
 class SQLQuery(BaseModel):
     sql: str = Field(..., description="Generated SQL query")
